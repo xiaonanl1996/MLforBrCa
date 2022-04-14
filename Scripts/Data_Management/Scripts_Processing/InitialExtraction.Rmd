@@ -1,0 +1,330 @@
+---
+title: "Initial Extraction"
+author: "Xiaonan Liu"
+date: "23/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(yaml)
+library(rsample)
+library(summarytools)
+library(arrow)
+library(naniar)
+library(rsvg)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(feather)
+library(here)
+library(Matrix)
+library(xgboost)
+library(rlist)
+
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+
+
+```
+
+```{r Data extraction}
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+options(rstudio.connectionObserver.errorsSuppressed = TRUE)
+
+# Exclusion Criteria
+exclusions <- function(data) {
+  
+  excl$initial <<- nrow(data)
+  
+  # Array as proxy for genetic data availability
+  data<-data%>%filter(!is.na(GeP_Array))
+  excl$genetic <<- nrow(data)
+
+  # BrCa PRS
+  data <- data[!is.na(data$TEU_BrCa_313_PRS),]
+  excl$corecomp<<-nrow(data)
+
+  # White British
+  data<-data%>%filter(!is.na(GeP_ethnic))
+  excl$white<<-nrow(data)
+
+  # Age
+  data<-data%>%filter(!(!is.na(TEU_BaC_AgeAtRec) & TEU_BaC_AgeAtRec<40 | TEU_BaC_AgeAtRec>=70))
+  excl$agewithin<<-nrow(data)
+
+
+  # Exclude males
+  data <- data[data$BaC_Sex=="Female",]
+  
+  excl$males <<- nrow(data)
+  
+  # # Exclude those with prior cancer (except BrCa and non-melanoma skin cancer)
+  #data <- data[is.na(data$OtherCancerDx_Date)|data$OtherCancerDx_Date>data$Rec_DateAssess,]
+  # # Exclude prevalent breast cancer
+  data <- data[is.na(data$BrCaDx_Prevalent),]
+  
+  excl$priorbrca <<- nrow(data)
+  
+  # Exclude prevalent carcinoma in situ
+  data <- data[is.na(data$BrCaInSitu_Prevalent),]
+  
+  excl$cinsitu <<- nrow(data)
+  
+  # Exclude prevalent Mastectomy
+  data <- data[data$TEU_HES_Mast_prev=="No",]
+  
+  excl$mast <<- nrow(data)
+  
+  # Number of ppl in other eth group
+  #other <- data[is.na(data$GeP_ethnic),]
+  #excl$other <<- nrow(other)
+  
+  # Exclude pre-menopause women
+  data <- data[data$FSF_Menopause=="Yes" & !is.na(data$FSF_Menopause),]
+  excl$menop <<- nrow(data)
+  
+  return(data)
+}
+
+excl <- list(initial=0)
+
+# 1. Extract/Save data
+data <-
+  #evalWithMemoization(
+  derive_variables(
+    database = config$data$database,
+    field_definitions = TEU_SPECS$BrCa_PRS,
+    exclusions = exclusions
+    #dictionary = "MLforBrCa.html"
+    #),
+    #key = c(TEU_SPECS$BrCa_PRS, exclusions)
+  )
+
+saveRDS(data,file = file.path(config$data$derived,'data.rds'))
+
+HES_CaR <-
+  #evalWithMemoization(
+  derive_variables(
+    database = config$data$database,
+    field_definitions = TEU_SPECS$HES_CaR,
+    exclusions = exclusions
+    #),
+    #key = c(TEU_SPECS$BrCa_PRS, exclusions)
+  )
+
+saveRDS(HES_CaR%>%
+          select(ID,starts_with(c("TEU_HES","TEU_CaR"))),
+        file = file.path(config$data$derived,'HES_CaR.rds'))
+
+
+
+```
+
+```{r Merge}
+
+# Need to inner join on 2 because BrCa_PRS derived on v5 db whereas HES_CaR was derived in V4 db
+# Ideally I would rerun everything using V5 db but it just takes too much time (2 days) and we know that
+# There's no data refresh, just more people withdrew in V5 db. 
+
+tot<-inner_join(data,HES_CaR,by="ID")%>%
+  # Rename common variables due to join (remove .x suffix)
+  rename_at(vars(ends_with(".x")),list(~sub("[.]x$", "", .)))%>%
+  # Pick out unnecessary columns
+  select(!c("BaC_Sex","TEU_BaC_DateOfBirth","Rec_DateAssess","TEU_ethnicgrp","TEU_Rec_AssessCentre",
+            "TEU_Edu_ISCED","TEU_HoH_PreTaxInc","TEU_HES_BrCa_inc","TEU_HES_BrCa_incdate","BaC_LostFUDate",
+            "TEU_BaC_AgeCat","TEU_Dth_NotBrCa_dthdate","TEU_Dth_NotBrCa_dthcause","TEU_BlP_nSBP",
+            "TEU_BlP_nDBP","BBC_RF_Result","BBC_OES_Result","TEU_CaR_C50_prev","TEU_CaR_D05_prev",
+            "GeP_UsedInPCA","GeP_Outliers","GeP_ethnic","GeP_Sex","GeP_Batch","OtherCancerDx_Date"),
+         -starts_with(c("BrCa","Admin","TEU_HES_Mast","CaU")),
+         -ends_with(c("_quintiles","percent",".0.0",".0.1",".y"))
+         )
+  
+
+saveRDS(tot,file = file.path(config$data$derived,paste0('tot_',format(Sys.time(), "%Y%m%d"),'.rds')))
+
+```
+
+
+```{r FC}
+
+# Analysis FC
+label1 <- paste0('UKB participants\\nn = ', excl$initial)
+label2 <- paste0('Unrelated White British participants with','\\n','good quality genotyping data, aged between 40 and 70\\n','n = ', excl$agewithin)
+label3 <- paste0('Females\\nn = ', excl$males)
+label4 <- paste0('No history of breast cancer events\\nn = ', excl$mast)
+label5 <- paste0('White post-menopausal females with genetic data\\nwithout prior breast cancer\\nn = ',excl$menop)
+
+label6 <- paste0(excl$ini-excl$genetic, ' missing genotyping data\\l', excl$genetic-excl$corecomp, ' excluded in genetic quality control\\l', excl$corecomp-excl$white,' not of genetically White British ancestry\\l',excl$white-excl$agewithin,' outside the age range of [40,70) years\\l')
+
+label7 <- paste0(excl$agewithin-excl$males,' males\\l')
+label8 <- paste0(excl$males-excl$priorbrca, ' prevalent breast cancer at baseline\\l', 
+                  excl$priorbrca-excl$cinsitu, ' prevalent breast carcinoma in situ at baseline\\l',
+                  excl$cinsitu-excl$mast, ' prevalent mastectomy at baseline\\l')
+label9 <-paste0(excl$mast-excl$menop, ' pre-menopausal female at baseline\\l')
+
+
+gv <- read_file(file.path(config$outputs$flowcharts, "Flowchart.gv"))
+
+export_svg(DiagrammeR::grViz(glue(gv))
+) %>% charToRaw %>% rsvg %>%
+  png::writePNG(file.path(config$outputs$descriptives, "BrCa_excl.png"))
+
+
+```
+
+
+```{r train-test-split}
+
+# Create training (80%) and test (20%) sets 
+# Use set.seed for reproducibility
+
+set.seed(123)
+tot_split <- initial_split(tot, prop = .8)
+tot_train <- training(tot_split)
+tot_test  <- testing(tot_split)
+
+
+```
+
+
+```{r Pre-processing}
+
+# Drop variables with 0 counts 
+tot_train<-tot_train%>%
+  select(where(~n_distinct(.) > 1))
+
+# Remove vars with >30% missing
+remove_vars<-tot_train%>%miss_var_summary()%>%filter(pct_miss>30)%>%pull(variable)
+
+tot_train<-tot_train%>%select(!all_of(remove_vars))
+
+saveRDS(tot_train,file = file.path(config$data$derived,'tot_train.rds'))
+
+# For transition from R to Python
+# https://stackoverflow.com/questions/63466010/what-is-the-recommended-way-to-access-data-from-r-data-table-in-python-can-i-av
+write_feather(tot_train,file.path(config$data$derived,'tot_train.feather'))
+
+
+#####
+tot_test<-tot_test[,names(tot_train)]
+
+saveRDS(tot_test,file = file.path(config$data$derived,'tot_test.rds'))
+write_feather(tot_test,file.path(config$data$derived,'tot_test.feather'))
+
+
+```
+
+```{r XGBoost pre-processing,eval=FALSE}
+
+#previous_na_action <- options('na.action')
+options(na.action='na.pass') # OW sparse.model.matrix remove the NAs (i.e. losing rows)
+
+# Create sparse matrix as input for XGBoost
+# Removed Uri_MicroAlbFlag only has one level and causing error
+# -1 is to remove the first column which is full of 1 (generated by the conversion)
+sparse_matrix <- sparse.model.matrix(TEU_BrCa_status~.-1, data = tot_train%>%
+                                       select(!c(Uri_MicroAlbFlag,TEU_BrCa_time,ID)))
+
+sparse_matrix_test <- sparse.model.matrix(TEU_BrCa_status~.-1, data = tot_test%>%
+                                       select(!c(Uri_MicroAlbFlag,TEU_BrCa_time,ID)))
+
+
+#options(na.action=previous_na_action$na.action)
+
+dtrain <- xgb.DMatrix(data = sparse_matrix, label=tot_train$TEU_BrCa_status)
+dtest <- xgb.DMatrix(data = sparse_matrix_test, label=tot_test$TEU_BrCa_status)
+
+xgb.DMatrix.save(dtrain, file.path(config$data$derived,"dtrain.buffer"))
+xgb.DMatrix.save(dtest, file.path(config$data$derived,"dtest.buffer"))
+```
+
+
+```{r pretty feature names for python}
+
+# Raw list
+pretty_names <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type="list")
+
+# Manually change some var name to be consistent across figs in the manuscript
+pretty_names$PhA_METsWkAllAct="Summed MET minutes per week"
+pretty_names$TEU_BaC_AgeAtRec="Age at recruitment"
+pretty_names$FSF_MenopauseAge="Age at menopause"
+pretty_names$FSF_PeriodAge="Age at menarche"
+pretty_names$BBC_PHOS_Result="Plasma phosphate"
+pretty_names$BBC_BUN_Result="Plasma urea"
+pretty_names$BlA_RedBCCount="Red blood cell count"
+
+# For categorical vars: Append level names behind
+categorical_columns<-tot_train%>% select_if(~class(.) == 'factor')%>%names()
+
+categorical_list<-list()
+
+for (var in categorical_columns) {
+  
+  for (level in levels(tot_train[[var]])) {
+    
+    categorical_list[paste0(var,"_",level)]=paste0(pretty_names[[var]],"(",level,")")
+    
+  }
+  #Because ohe in python also create missing indicator for categorical vars
+  categorical_list[paste0(var,"_nan")]=paste0(pretty_names[[var]],"(Missing)")
+}
+
+
+# Append with current pretty_names
+
+full_pretty_names<-c(pretty_names,categorical_list)
+
+# Save
+list.save(full_pretty_names,file=file.path(config$data$derived,"full_pretty_names.json"))
+```
+
+```{r Descrp stats,eval=FALSE}
+
+pretty_func <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type = "function")
+
+
+# Train data
+
+# Pretty variable names
+pretty_colnames<-sapply(names(tot_train), function(i) pretty_func(i))
+
+tmp<-tot_train;names(tmp)<-pretty_colnames
+
+#p<-dfSummary(tmp);view(p)
+
+print(dfSummary(tmp,
+                valid.col = FALSE,
+                #headings=FALSE,
+                max.string.width=406),
+      caption='Descriptive characteristics of training data (MLforBrCa)',
+      file = file.path(config$outputs$descriptives,'DescrpStats_train.html'))
+
+
+
+# Test data
+
+# Pretty variable names
+pretty_colnames<-sapply(names(tot_test), function(i) pretty_func(i))
+
+tmp<-tot_test;names(tmp)<-pretty_colnames
+
+#p<-dfSummary(tmp);view(p)
+
+print(dfSummary(tmp,
+                valid.col = FALSE,
+                #headings=FALSE,
+                max.string.width=406),
+      caption='Descriptive characteristics of test data (MLforBrCa)',
+      file = file.path(config$outputs$descriptives,'DescrpStats_test.html'))
+
+
+```
+
+
+
+

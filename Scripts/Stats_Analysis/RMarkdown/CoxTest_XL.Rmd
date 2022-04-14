@@ -1,0 +1,1080 @@
+---
+title: "MLforBrCa Cox model on training data"
+author: "Xiaonan Liu"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    code_folding: show
+    highlight: kate
+---
+
+```{r setup, include=FALSE,message=FALSE,warning=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(grid)
+library(dplyr)
+library(survival)
+library(survminer)
+library(naniar)
+library(summarytools)
+library(rsample)      # data splitting 
+library(gbm)          # basic implementation
+library(xgboost)      # a faster implementation of gbm
+library(caret)        # an aggregator package for performing many machine learning models
+library(h2o)          # a java-based platform
+library(pdp)          # model visualization
+library(lime)         # model visualization
+library(vip)          # Feature importance visualisation
+library(rms)
+library(mice)
+library(shiny)
+library(gtools)
+library(ggeffects)
+library(mitml)
+library(rcompanion)
+
+# Specify the markdown format for knitr tables, otherwise they're not compatible with kableExtra
+options(knitr.kable.NA='', knitr.table.format = "html")
+options(kableExtra.auto_format = FALSE)
+options(rstudio.connectionObserver.errorsSuppressed = TRUE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions$JC))
+
+#-------------------------------------------------------------------------------------------------------------------
+# Setup
+
+figure <- 1
+table <- 1
+suppfig <- 1
+footnote_no <- 1
+
+
+tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
+tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
+
+xgboost_SHAP<-read.csv(here::here(file.path(config$outputs$outputs,"XGBoost_SHAP.csv")))
+
+load(here::here(file.path(config$data$derived,"imp_post.rds")))
+load(here::here(file.path(config$data$derived,"imp_post_derived.rds")))
+
+```
+
+```{r Data extraction,include=FALSE}
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+pretty_names <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type="list")
+pretty_func <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type = "function")
+
+```
+
+# Introduction
+
+This report documents the analysis outputs for further inspection on 'important' features from XGBoost using Cox model on training data. (Yes the file name is a bit confusing...)
+
+
+# Stratified Cox model by age groups
+
+Categorised age in 3 groups: [40,53), [53,62), [62,70) and performed stratified cox model by 3 age groups: 
+
+* BrCa ~ PRS + Genetic Array + First 10 genetic PCs
+
+Note: Originally we wanted to categorise PRS into percentiles according to Mavaddat2019 (i.e. <1%, 1-5%, ...); however, due to sample size of each age group, we ran into model convergence issue.
+
+**BrCa 100k PRS:**
+
+```{r}
+
+df<-tot_train%>%
+  mutate(agecat=cut(TEU_BaC_AgeAtRec,
+                       breaks = c(40, 53, 62, 70),
+                       labels = c("[40,53)", "[53,62)", "[62,70)"),
+                       right = FALSE
+    ),
+  TEU_BrCa_100k_PRS=TEU_BrCa_100k_PRS*115300*2,
+  TEU_BrCa_313_PRS=TEU_BrCa_313_PRS*305*2,
+  PRS_100k=quantcut(TEU_BrCa_100k_PRS,q=5,labels=c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')),
+  PRS_313=quantcut(TEU_BrCa_313_PRS,q=5,labels=c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')))
+
+
+# Relevel so that average is the ref
+#df <- within(df, PRS_100k_tertile <- relevel(PRS_100k_tertile, ref = "Average"))
+#df <- within(df, PRS_313_tertile <- relevel(PRS_313_tertile, ref = "Average"))
+
+propped(table(df$agecat))
+
+RFs<-c("PRS_100k","GeP_Array",paste0("GeP_PC_",1:10))
+
+formula<-as.formula(paste0("Surv(TEU_BrCa_time,TEU_BrCa_status)~", 
+                           paste(RFs, collapse="+")))
+
+cox_results=lapply(split(df, df$agecat),
+       FUN = function(DF) {
+         
+         coxph(formula, DF)
+       })
+
+
+```
+
+
+
+```{r}
+
+tab1=printcoxresults(df,varlist = "PRS_100k",modeloutput = cox_results$`[40,53)`,pretty_names = pretty_names,forplot = TRUE)
+
+tab1$agegrp="[40,53)"
+
+
+tab2=printcoxresults(df,varlist =  "PRS_100k",modeloutput = cox_results$`[53,62)`,pretty_names = pretty_names,forplot=TRUE)
+
+tab2$agegrp="[53,62)"
+
+tab3=printcoxresults(df,varlist =  "PRS_100k",modeloutput = cox_results$`[62,70)`,pretty_names = pretty_names,forplot=TRUE)
+
+tab3$agegrp="[62,70)"
+
+tab=rbind(tab1,tab2,tab3)
+
+kable(tab,caption = "Hazard Ratio of BrCa 100k PRS in different age groups")%>%
+ kable_styling(bootstrap_options = c("striped", "hover")) 
+
+# Visualise PRS effect SC by age
+
+ggplot(tab, aes(fill=factor(Levels,levels = c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')), y=HR_num, x=agegrp)) + 
+    geom_bar(position="dodge", stat="identity") +
+  geom_errorbar(aes(ymin=LCI, ymax=UCI), width=.2,
+                 position=position_dodge(.9)) +
+  labs(x="Age at recruitment, years (Categorical)",y="Hazard Ratio with 95% CI",title = "") + 
+  scale_fill_discrete(name = expression(bold(PRS["120k"]~quintiles)))+
+  theme(legend.position = "top",legend.text = element_text(size=12),
+        axis.text = element_text(size=15))
+
+```
+
+
+**BrCa 313 PRS:**
+
+```{r}
+
+RFs<-c("PRS_313","GeP_Array",paste0("GeP_PC_",1:10))
+
+formula<-as.formula(paste0("Surv(TEU_BrCa_time,TEU_BrCa_status)~", 
+                           paste(RFs, collapse="+")))
+
+cox_results=lapply(split(df, df$agecat),
+       FUN = function(DF) {
+         
+         coxph(formula, DF)
+       })
+
+
+```
+
+
+```{r}
+
+tab1=printcoxresults(df,varlist = "PRS_313",modeloutput = cox_results$`[40,53)`,pretty_names = pretty_names,forplot = TRUE)
+
+tab1$agegrp="[40,53)"
+
+
+tab2=printcoxresults(df,varlist =  "PRS_313",modeloutput = cox_results$`[53,62)`,pretty_names = pretty_names,forplot=TRUE)
+
+tab2$agegrp="[53,62)"
+
+tab3=printcoxresults(df,varlist =  "PRS_313",modeloutput = cox_results$`[62,70)`,pretty_names = pretty_names,forplot=TRUE)
+
+tab3$agegrp="[62,70)"
+
+tab=rbind(tab1,tab2,tab3)
+
+kable(tab,caption = "Hazard Ratio of BrCa 313 PRS in different age groups")%>%
+ kable_styling(bootstrap_options = c("striped", "hover")) 
+
+# Visualise PRS effect SC by age
+
+ggplot(tab, aes(fill=factor(Levels,levels = c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')), y=HR_num, x=agegrp)) + 
+    geom_bar(position="dodge", stat="identity") +
+  geom_errorbar(aes(ymin=LCI, ymax=UCI), width=.2,
+                 position=position_dodge(.9)) +
+  labs(x="Age at recruitment, years (Categorical)",y="Hazard Ratio with 95% CI",title = "") + 
+  scale_fill_discrete(name = expression(bold(PRS["313"]~quintiles)))+
+  theme(legend.position = "top",legend.text = element_text(size=12),
+        axis.text = element_text(size=15))
+
+```
+
+
+# Features Inspection
+
+First we would start with a set containing the union of the following:
+
+* Top 20 'important' features based on SHAP values
+* Other established breast cancer risk factors (BMI, physical activity, age at menarche, number of live births, hormone replacement treatment)
+
+Note: The established breast cancer risk factors that were not picked out as top 20 important features from XGBoost all had non-zero SHAP values, they just didn't make to top 20.
+
+
+```{r imp features}
+
+
+imp_features<-c(
+  xgboost_SHAP$Var_name[c(1:5,7:20)],
+  # Because FaH of BrCa var name is in a different format
+  "TEU_FaH_BrCa",
+  # established RFs
+  "BSM_BMI", "PhA_METsWkAllAct", "G03FA","FSF_PeriodAge",
+   "FSF_NLiveBirths" 
+)
+
+
+```
+
+Taking the union lead to total of `r length(imp_features)` features to start with. 
+
+```{r}
+
+sapply(imp_features,function(i) pretty_names[[i]])
+
+```
+
+# Correlation filtering (On Training Data)
+
+Now that we've got the union of features, we performed a correlation based feature elimination (taking established RFs into account) using training data:  
+
+For categorical vs categorical with a bias corrected Cramer's V, numeric vs numeric with Spearman (default), and categorical vs numeric with ANOVA. 
+
+Threshold of 0.9 was used to identify sets of highly correlated predictors and removed all but one (the one with the least missingness unless very strong prior preference) to carry forward to cox model for further investigation.
+
+This approach was based on [Madakkatel2021](https://www.nature.com/articles/s41598-021-02476-9).
+
+```{r cor,cache=TRUE}
+
+cor=mixed_assoc(tot_train%>%select(all_of(imp_features)))
+
+# Filter for correlation above 0.9
+cor%>%filter(x!=y & assoc>0.9)%>%
+  rowwise()%>%
+  mutate(x=pretty_func(x),
+         y=pretty_func(y))%>%
+  rename(Var1=x,Var2=y,Correlation=assoc)
+
+```
+
+The observation is variables from [Body composition by impedance](https://biobank.ndph.ox.ac.uk/showcase/label.cgi?id=100009) BMI and whole body fat mass are highly correlated (which is expected). We would remove BMI and retain whole body fat mass because whole body fat mass captures is assumed to be superior than BMI.
+
+```{r missing train}
+
+highcor=cor%>%filter(x!=y & assoc>0.9)%>%pull(x)%>%unique
+
+tot_train%>%select(all_of(imp_features))%>%miss_var_summary()%>%rowwise()%>%mutate(variable=pretty_func(variable))
+
+```
+
+
+```{r remove Imp}
+
+imp_features<-imp_features[!grepl("BSM_BMI",imp_features)]
+
+```
+
+Now we have total of `r length(imp_features)` features.
+
+# Missingness (On Training Data)
+
+After inspection of missingness above, **"Age at first birth"** should be treated as missing not at random. One possible way is to categorise them and treat the missingness as a category.
+
+To retain information as much as possible, we kept as many categories as possible and also made sure the frequency of each category was too sparse. 
+
+
+```{r categorise}
+
+tot_train<-tot_train%>%
+  mutate(TEU_FirstBirthAgeCat=factor(case_when(
+    # If no live births given, assign "No births"
+    FSF_NLiveBirths==0 ~ "No Births",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge<20 ~ "<20",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=20 & TEU_FirstBirthAge<30 ~ "20-30",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=30 & TEU_FirstBirthAge<40 ~ "30-40",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=40 ~ ">=40",
+    TRUE ~ NA_character_
+  ),levels=c("No Births","<20","20-30","30-40",">=40")),
+  
+  TEU_LastBirthAgeCat=factor(case_when(
+    # If no live births given, assign "No births"
+    FSF_NLiveBirths==0 ~ "No Births",
+    FSF_NLiveBirths>0 & TEU_LastBirthAge<20 ~ "<20",
+    FSF_NLiveBirths>0 & TEU_LastBirthAge>=20 & TEU_LastBirthAge<30 ~ "20-30",
+    FSF_NLiveBirths>0 & TEU_LastBirthAge>=30 & TEU_LastBirthAge<40 ~ "30-40",
+    FSF_NLiveBirths>0 & TEU_LastBirthAge>=40 ~ ">=40",
+    TRUE ~ NA_character_
+  ),levels=c("No Births","<20","20-30","30-40",">=40")),
+  
+  TEU_FatherDthAgeCat=factor(case_when(
+    FaH_FatherAlive=="No" & FaH_FatherDeathAge<40 ~ "<40",
+    FaH_FatherAlive=="No" & FaH_FatherDeathAge>=40 & FaH_FatherDeathAge<60 ~ "40-60",
+    FaH_FatherAlive=="No" & FaH_FatherDeathAge>=60 & FaH_FatherDeathAge<80 ~ "60-80",
+    FaH_FatherAlive=="No" & FaH_FatherDeathAge>=80 ~ ">=80",
+    # If participants indicate their father still alive, assign alive
+    FaH_FatherAlive=="Yes" ~ "Alive",
+    TRUE ~ NA_character_
+  ),levels = c("<40","40-60","60-80",">=80","Alive"))
+  
+  )
+
+# Replace Father death age and age at first birth with the manipulated ones 
+
+imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
+#imp_features=replace(imp_features,imp_features=="TEU_LastBirthAge","TEU_LastBirthAgeCat")
+#imp_features=replace(imp_features,imp_features=="FaH_FatherDeathAge","TEU_FatherDthAgeCat")
+
+# Add those 2 vars pretty names 
+
+pretty_names$TEU_FirstBirthAgeCat="Age at First birth (Categorical)"
+#pretty_names$TEU_LastBirthAgeCat="Age at Last birth (Categorical)"
+#pretty_names$TEU_FatherDthAgeCat="Father death age (Categorical)"
+
+```
+
+After data manipulation, check how much data we would lose by doing a complete case analysis:
+
+```{r}
+
+comp_data<-tot_train[,c("TEU_BrCa_status","TEU_BrCa_time",
+                       imp_features,
+                       "GeP_Array",paste0("GeP_PC_",1:10)
+                       )]%>%na.omit
+
+# How much data did we lose?
+lose=round((nrow(tot_train)-nrow(comp_data))/nrow(tot_train)*100,2)
+
+```
+We would lose `r lose`% of the data due to missing data, hence we'd like to perform multiple imputation (MI).
+
+# Multiple Imputation
+
+
+```{r MI data}
+
+# Prepare MI data
+
+MI_data=tot_train[,c("TEU_BrCa_status","TEU_BrCa_time",
+                       imp_features,
+                       "GeP_Array",paste0("GeP_PC_",1:10)
+                       )]
+
+
+# Need to Scale up PRS
+
+MI_data=MI_data%>%
+  mutate(TEU_BrCa_100k_PRS=TEU_BrCa_100k_PRS*115300*2,
+         TEU_BrCa_313_PRS=TEU_BrCa_313_PRS*305*2)
+
+
+```
+
+
+```{r MI post-menopause,eval=FALSE}
+# This process is time-consuming, hence eval=FALSE, I ran manually
+
+# Create Imputations (iter=20, M=10)
+
+# Using default imputation method based on variable type
+
+# Since we have number of live births and age at first birth, we need to keep this relationship during MI
+# ie. If women had no births, then age at first birth should be "No births"
+ini <- mice(MI_data,maxit = 0,print=FALSE)
+post <- ini$post
+post["TEU_FirstBirthAgeCat"] <- "imp[[j]][data$FSF_NLiveBirths[!r[,j]]==0,i] <- 'No Births'"
+post["FSF_NLiveBirths"] <- "imp[[j]][data$TEU_FirstBirthAgeCat[!r[,j]]=='No Births',i] <- 0"
+
+pred <- quickpred(MI_data,include = c("TEU_BrCa_status", "TEU_BrCa_time",
+                                      "TEU_BrCa_100k_PRS","TEU_BrCa_313_PRS",
+                                          "TEU_BaC_AgeAtRec","Imp_BodyFatMass","PhA_METsWkAllAct",
+                                          "TEU_Alc_WeeklyAlcUnits","TEU_FaH_BrCa",
+                                          "G03FA","FSF_PeriodAge","FSF_NLiveBirths",
+                                          "TEU_FirstBirthAgeCat"))
+
+imp_post<-mice(MI_data,post=post,pred=pred,maxit = 20,seed = 100,m=10) 
+
+save(imp_post,file=file.path(config$data$derived,'imp_post.rds'))
+
+
+
+```
+
+```{r test,eval=FALSE}
+
+# Main purpose of this test is to make sure First Age birth and Number of live births are consistent throughout MI
+test=mice(MI_data,maxit = 5,seed = 100,m=1,post=post)
+
+test_long=complete(imp_post,"long")
+
+test_long%>%filter(TEU_FirstBirthAgeCat!="No Births"&FSF_NLiveBirths==0)%>%select(TEU_FirstBirthAgeCat,FSF_NLiveBirths)
+
+test_long%>%filter(TEU_LastBirthAgeCat!="No Births"&FSF_NLiveBirths==0)%>%select(TEU_LastBirthAgeCat,FSF_NLiveBirths)
+
+```
+
+```{r Diagnostics,eval=FALSE}
+
+## 1. Assess Convergence 
+plot(imp_post)
+
+## 2. Compare summary stats between observed and completed (observed + imputed) data
+
+# Extract completed data after MI
+
+imp1=imp_post
+
+#MI_data=MI_data_post;imp1=imp_post
+
+  
+long1 <- complete(imp1,"long") 
+long1$.imp <- as.factor(long1$.imp)
+
+
+
+num_plot <- list() #Save the density plots
+factor_tb <- list() # Save the freq tables 
+
+# Variables with missing data
+missing_var=MI_data%>%miss_var_summary()%>%filter(n_miss!=0)%>%pull(variable)
+
+for (var in missing_var){
+  
+  if (is.numeric(MI_data[[var]])){
+    # If numeric, plot density between observed and imputed 
+    
+    #long1 <- cbind(long1, ind.na=is.na(imp1$data[[var]]))
+    long1 <- long1 %>%
+      mutate(ind.na=rep(is.na(imp1$data[[var]]),10))
+    
+    p<-densityplot(~long1[[var]]|.imp, data=long1, group=ind.na, plot.points=FALSE,
+                ref=TRUE, xlab=paste0(var),scales=list(y=list(draw=F)),
+                par.settings=simpleTheme(col.line=rep(c("blue","red"))), 
+                auto.key = list(columns=2,text=c("Observed","Imputed")))
+    
+    num_plot[[var]]=p
+    
+  }else{
+    # If factor, produce freq table of each level between observed and imputed 
+    long1 <- long1 %>%
+      mutate(ind.na=rep(ifelse(is.na(imp1$data[[var]]),'Imputed','Observed'),10))
+    
+    factor_tb[[var]] <- lapply(unique(long1$.imp), function(i) 
+      prop.table(table(long1%>%filter(.imp==i)%>%pull(ind.na),
+                       long1%>%filter(.imp==i)%>%pull(var)), margin = 1)*100)
+    
+  }
+}
+
+
+# For continuous variables that had missing <10%, we probably shouldn't be counting on density plot much
+
+lessmiss_var=MI_data%>%miss_var_summary()%>%filter(pct_miss<10 & pct_miss!=0 & !variable %in% names(factor_tb))%>%pull(variable)
+
+MIcompare<-function(variable){
+  
+  print(variable)
+  
+  if(is.numeric(MI_data[[variable]])){
+    # print observed summary
+  print(summary(MI_data[[variable]]))
+  
+  # print observed + imputed summary
+  print(lapply(1:10, function(i) summary(long1%>%filter(.imp==i)%>%pull(!!variable))))
+  
+  }else{
+    # print observed freq
+  print(prop.table(table(MI_data[[variable]])))
+  
+  # print observed + imputed freq
+  print(lapply(1:10, function(i) prop.table(table(long1%>%filter(.imp==i)%>%pull(!!variable)))))
+    
+  }
+
+}
+
+MIcompare(lessmiss_var[1])
+
+MIcompare(names(factor_tb)[1])
+
+
+```
+
+```{r post-processing,eval=FALSE}
+
+# Scale alcohol per week to per day
+# Scale PRS to percentiles
+# Age into 3 groups for later inspection 
+
+long1<-complete(imp_post,"long",include=TRUE)
+
+comp_long1<-long1%>%
+  mutate(
+    TEU_Alc_DailyAlcUnits=TEU_Alc_WeeklyAlcUnits/7,
+    TEU_BaC_AgeCat=cut(TEU_BaC_AgeAtRec,
+                       breaks = c(40, 53, 60, 70),
+                       labels = c("[40,53)", "[53,60)", "[60,70)"),
+                       right = FALSE
+    ))%>%
+  group_by(.imp)%>%
+  mutate(TEU_BrCa_100k_PRS_percent=Percentile(TEU_BrCa_100k_PRS),
+         TEU_BrCa_313_PRS_percent=Percentile(TEU_BrCa_313_PRS),
+         TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')),
+         TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')))
+  
+
+comp_long1<-as.mids(comp_long1)
+
+
+save(comp_long1,file=file.path(config$data$derived,'imp_post_derived.rds'))
+
+
+```
+
+```{r post-processing scale,eval=FALSE}
+
+# Post-hoc: Scale variables with HR CI (1,1) to show wider CI in forest plot
+# Scale alcohol per week to per day
+# Create quintiles for PRS
+
+long1<-complete(imp_post,"long",include=TRUE)
+
+comp_long1_scaled<-long1%>%
+  mutate(
+    TEU_Alc_DailyAlcUnits=TEU_Alc_WeeklyAlcUnits/7,
+    )%>%
+  group_by(.imp)%>%
+  mutate(
+    # Scale variables by mean and sd within each imp
+    Imp_MetRate=scale_this(Imp_MetRate),
+    Uri_Sodium=scale_this(Uri_Sodium),
+    Uri_Creat=scale_this(Uri_Creat),
+    BBC_ALP_Result=scale_this(BBC_ALP_Result),
+    PhA_METsWkAllAct=scale_this(PhA_METsWkAllAct),
+    TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')),
+    TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score'))
+  )
+  
+
+comp_long1_scaled<-as.mids(comp_long1_scaled)
+
+
+save(comp_long1_scaled,file=file.path(config$data$derived,'imp_post_derived_scaled.rds'))
+
+
+```
+
+
+```{r add extra pretty names}
+
+pretty_names$TEU_Alc_DailyAlcUnits="Daily alcohol intake"
+pretty_names$TEU_BrCa_100k_PRS="$$PRS_{120k}$$"
+pretty_names$TEU_BrCa_313_PRS="$$PRS_{313}$$"
+pretty_names$TEU_BrCa_100k_PRS_quintiles="$$PRS_{120k}$$ quintiles"
+pretty_names$TEU_BrCa_313_PRS_quintiles="$$PRS_{313}$$ quintiles"
+pretty_names$TEU_BrCa_313_PRS_percent="$$PRS_{313}$$ percentiles"
+pretty_names$TEU_BrCa_100k_PRS_quint=pretty_names$TEU_BrCa_100k_PRS_quintiles
+pretty_names$TEU_BrCa_313_PRS_quint=pretty_names$TEU_BrCa_313_PRS_quintiles
+pretty_names$G03FA="HRT user"
+
+
+```
+
+# Baseline Model
+
+**N=`r nrow(MI_data)`** with `r sum(MI_data$TEU_BrCa_status)` breast cancer cases.
+
+We built the Cox model: 
+
+* Baseline model: BrCa ~ Established RFs 
+
+(XL): PRS were categorised into quintiles. Weekly alcohol intake was divided by 7 to reflect daily alcohol intake.
+
+```{r Baseline model}
+
+eRFs <- c("TEU_BrCa_100k_PRS_quint","TEU_BrCa_313_PRS_quint","TEU_BaC_AgeAtRec","Imp_BodyFatMass","FSF_MenopauseAge","TEU_Alc_DailyAlcUnits","TEU_FirstBirthAgeCat","TEU_FaH_BrCa" ,  "PhA_METsWkAllAct" ,"G03FA", "FSF_PeriodAge","BBC_IGF1_Result" ,"BBC_TES_Result", "FSF_NLiveBirths" ,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(eRFs, collapse="+"))
+
+rmodel <- with(comp_long1, coxph(as.formula(formula)))
+
+routput_baseline <- printMIresults(df=comp_long1$data, varlist=eRFs, modeloutput=summary(pool(rmodel)),
+                              pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE)
+
+#View(routput_baseline)
+#kable(routput_baseline)%>%
+  #kable_styling(bootstrap_options = c("striped", "hover")) 
+```
+
+
+```{r Analysis Diag,eval=FALSE}
+
+pha_plots<-list() #save PHA plot for each imputation
+vifs<-list() #save multicollinearity results
+
+imp1=comp_long1
+
+for (i in 1:imp1$m) {
+  ## 1. PHA
+  pha_plots[[i]]<-ggcoxzph(cox.zph(rmodel$analyses[[i]]))
+  
+  ## 2. Multicollinearity
+  formula<-as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status) ~ 
+    TEU_BrCa_100k_PRS_quint + TEU_BrCa_313_PRS_quint + TEU_BaC_AgeAtRec + 
+    Imp_BodyFatMass + FSF_MenopauseAge + TEU_Alc_DailyAlcUnits +
+    TEU_FirstBirthAgeCat + TEU_FaH_BrCa +  PhA_METsWkAllAct +
+    G03FA  + BBC_TES_Result +  FSF_PeriodAge + BBC_IGF1_Result +FSF_NLiveBirths+
+    GeP_Array + GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + 
+    GeP_PC_6 + GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10")
+  
+  vifs[[i]]<-rms::vif(cph(formula,data=complete(comp_long1,i)))
+  cat("Imputation",i,", Any VIF above>10:",any(vifs[[i]]>10),'\n')
+  
+}
+
+# Use shinyapp for better visualisation
+
+choices = 1:imp1$m
+
+names(choices) <- paste("Imputation",1:imp1$m)
+shinyApp(
+  ui = fluidPage(
+    titlePanel("PHA plot on each imputation"),
+    sidebarPanel(
+      selectInput("plot", "Choose plot:", choices=choices),
+      hr()),
+      #helpText("Trail plots")),
+    plotOutput("mainplot")
+  ),
+  server = function(input, output) {
+    output$mainplot<-renderPlot({
+      i<- as.integer(input$plot)
+      pha_plots[[i]]
+    }, height = 1000, width = 2000)
+  }
+)
+
+
+```
+
+Concordance index of baseline model in each imputation dataset: 
+
+```{r}
+
+post_long1<-complete(comp_long1,"long")
+
+pool<-post_long1%>%
+  group_by(.imp)%>%
+  summarise(.,`C-index`=concordance(coxph(formula=as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status) ~ 
+    TEU_BrCa_100k_PRS_quint + TEU_BrCa_313_PRS_quint + TEU_BaC_AgeAtRec + 
+    Imp_BodyFatMass + FSF_MenopauseAge + TEU_Alc_DailyAlcUnits +
+    TEU_FirstBirthAgeCat + TEU_FaH_BrCa +  PhA_METsWkAllAct +
+    G03FA  + BBC_TES_Result +  FSF_PeriodAge + BBC_IGF1_Result +FSF_NLiveBirths+
+    GeP_Array + GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + 
+    GeP_PC_6 + GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10")))$concordance)
+
+pool
+```
+
+
+
+# New Model 1 (Add new vars)
+
+* New Model 1: BrCa ~ Established RFs + New potential RFs
+
+```{r}
+# Transform the variables fitted in the model
+imp_features=replace(imp_features,imp_features=="TEU_Alc_WeeklyAlcUnits","TEU_Alc_DailyAlcUnits")
+imp_features=replace(imp_features,imp_features=="TEU_BrCa_100k_PRS","TEU_BrCa_100k_PRS_quint")
+imp_features=replace(imp_features,imp_features=="TEU_BrCa_313_PRS","TEU_BrCa_313_PRS_quint")
+
+```
+
+```{r New Model 1}
+
+varlist <- c(imp_features,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
+
+rmodel_m1 <- with(comp_long1, coxph(as.formula(formula)))
+
+routput_m1 <- printMIresults(df=comp_long1$data, varlist=varlist, modeloutput=summary(pool(rmodel_m1)),
+                              pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE)
+
+#kable(routput_m1)%>%
+ # kable_styling(bootstrap_options = c("striped", "hover")) 
+```
+
+```{r,eval=FALSE}
+
+pha_plots<-list() #save PHA plot for each imputation
+vifs<-list() #save multicollinearity results
+
+imp1=comp_long1
+
+for (i in 1:imp1$m) {
+  ## 1. PHA
+  pha_plots[[i]]<-ggcoxzph(cox.zph(rmodel$analyses[[i]]))
+  
+  ## 2. Multicollinearity
+  formula<-as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status) ~ 
+    TEU_BrCa_100k_PRS_quint + TEU_BrCa_313_PRS_quint + TEU_BaC_AgeAtRec + 
+    Imp_BodyFatMass + FSF_MenopauseAge + TEU_Alc_DailyAlcUnits +
+    TEU_FirstBirthAgeCat + TEU_FaH_BrCa +  PhA_METsWkAllAct +
+    G03FA  + BBC_TES_Result +  FSF_PeriodAge + BBC_IGF1_Result +FSF_NLiveBirths+
+    BBC_BUN_Result + Imp_MetRate + BBC_PHOS_Result + Uri_Sodium + BlA_RedBCCount +
+    BBC_AST_Result + Uri_Creat + BlA_MonocytCount + BBC_ALP_Result + 
+    BBC_CRP_Result +
+    GeP_Array + GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + 
+    GeP_PC_6 + GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10")
+  
+  vifs[[i]]<-rms::vif(cph(formula,data=complete(comp_long1,i)))
+  cat("Imputation",i,", Any VIF above>10:",any(vifs[[i]]>10),'\n')
+  
+}
+
+# Use shinyapp for better visualisation
+
+choices = 1:imp1$m
+
+names(choices) <- paste("Imputation",1:imp1$m)
+shinyApp(
+  ui = fluidPage(
+    titlePanel("PHA plot on each imputation"),
+    sidebarPanel(
+      selectInput("plot", "Choose plot:", choices=choices),
+      hr()),
+      #helpText("Trail plots")),
+    plotOutput("mainplot")
+  ),
+  server = function(input, output) {
+    output$mainplot<-renderPlot({
+      i<- as.integer(input$plot)
+      pha_plots[[i]]
+    }, height = 1000, width = 2000)
+  }
+)
+
+```
+
+```{r forest plot}
+
+# Change order of FaH so corresponding to the SHAP order
+present=setdiff(imp_features,"TEU_FaH_BrCa")
+present <- append(present, values = "TEU_FaH_BrCa", after = match("TEU_Alc_DailyAlcUnits", present) - 1)                
+
+m1_forplot <- printMIresults(df=comp_long1$data, varlist=present, modeloutput=summary(pool(rmodel_m1)),
+                                pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE,forplot = TRUE)
+
+cox_m1<-m1_forplot%>%
+  # Create HR (95% CI)
+  mutate(HR_CI=ifelse(is.na(L_CI),NA_character_,paste0(pretty_dp(HR_num,2)," ",pretty_confint(L_CI, U_CI, dp=2))))
+
+cox_m1$HR_CI[is.na(cox_m1$HR_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- "1"
+cox_m1$HR_num[is.na(cox_m1$HR_num) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+cox_m1$L_CI[is.na(cox_m1$L_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+cox_m1$U_CI[is.na(cox_m1$U_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+
+# Hacky tweak so the cox model names correpsond to SHAP names
+cox_m1$IDcol[cox_m1$IDcol=="****$$PRS_{120k}$$ quintiles****"]="TEU_BrCa_100k_PRS"
+cox_m1$IDcol[cox_m1$IDcol=="****$$PRS_{313}$$ quintiles****"]="TEU_BrCa_313_PRS"
+cox_m1$IDcol[cox_m1$IDcol=="**Family history of BrCa**"]="TEU_FaH_BrCa_Family history of BrCa"
+cox_m1$IDcol[cox_m1$IDcol=="**Age at First birth (Categorical)**"]="TEU_FirstBirthAge"
+cox_m1$IDcol[cox_m1$IDcol=="TEU_Alc_DailyAlcUnits"]="TEU_Alc_WeeklyAlcUnits"
+
+# Prepare SHAP 
+
+shap<-xgboost_SHAP[1:20,]%>%
+  select(Var_name,SHAP)%>%
+  #mutate(norm_SHAP=(SHAP-min(SHAP))/(max(SHAP)-min(SHAP)))%>%
+  mutate(SHAP_pretty=pretty_dp(SHAP,2))
+
+#shap$Var_name[shap$Var_name=="TEU_FaH_BrCa_Family history of BrCa"]="TEU_FaH_BrCa"
+#shap$Var_name[shap$Var_name=="TEU_BrCa_100k_PRS"]="TEU_BrCa_100k_PRS_quintiles"
+#shap$Var_name[shap$Var_name=="TEU_BrCa_313_PRS"]="TEU_BrCa_313_PRS_quintiles"
+#shap$Var_name[shap$Var_name=="TEU_FirstBirthAge"]="TEU_FirstBirthAgeCat"
+#shap$Var_name[shap$Var_name=="TEU_Alc_WeeklyAlcUnits"]="TEU_Alc_DailyAlcUnits"
+#shap$Var_name2=preparecoefflist_2col(df=comp_long1$data,varname = shap$Var_name,pretty_names = pretty_names)
+
+# Left join 
+
+cox_shap<-left_join(cox_m1,shap,by=c("IDcol"="Var_name"))%>%
+  select(Coefficient,SHAP_pretty,HR_CI,p,HR_num,L_CI,U_CI)%>%
+  mutate(summary=FALSE)%>%
+  mutate(Coefficient=str_remove_all(Coefficient,fixed("**")))%>%
+  add_row(Coefficient = "Features", SHAP_pretty="SHAP Value",HR_CI="HR (95% CI)",p="p-value", summary=TRUE,.before = 1)%>%
+  rename(mean=HR_num,lower=L_CI,upper=U_CI)
+  
+
+
+# initialize plot
+#tiff(file.path(config$outputs$outputs,"forestplot_A.tiff"),  units = "in", width = 7, height = 25, res = 300)
+
+# make plot
+
+tabletext <- list(
+ c("Features",append(list(expression(PRS["120k"]~quintiles)),cox_shap$Coefficient[3:7]),append(list(expression(PRS["313"]~quintiles)),cox_shap$Coefficient[9:21])),
+  cox_shap$SHAP_pretty[1:21],
+  cox_shap$HR_CI[1:21],
+  cox_shap$p[1:21]
+)
+
+
+
+cox_shap[1:21,]%>%
+  forestplot(labeltext = tabletext, 
+             is.summary = summary,
+             clip = c(0.3, 2.8), 
+             hrzl_lines = list("2" = gpar(lwd = 1, columns = 1:5, col = "#000044"), 
+                               "3" = gpar(lwd=1),
+                               "9" = gpar(lwd=1),
+                               "18" = gpar(lwd=1)),
+             xlog = FALSE,
+             boxsize=0.3,
+             graph.pos=3,
+             colgap=unit(3, 'mm'),
+             graphwidth=unit(34, 'mm'),
+             lwd.ci=2,
+             lwd.xaxis=2,
+             zero = 1,
+             xticks = seq(0.5, 2.5, 0.5), 
+             #mar = unit(rep(10, times = 4), "mm"),
+             col = fpColors(box = "royalblue",
+                            line = "darkblue", 
+                            summary = "royalblue"))
+
+# save plot
+#dev.copy(png,file.path(config$outputs$outputs,"forestplot.png"))
+#dev.off()
+
+## Too long, has to be split into 2
+#tiff(file.path(config$outputs$outputs,"forestplot_B.tiff"),  units = "in", width = 13, height = 50, res = 300)
+
+# make plot
+cox_shap[c(1,22:nrow(cox_shap)),]%>%
+  forestplot(labeltext = c(Coefficient, SHAP_pretty, HR_CI,p), 
+             is.summary = summary,
+             clip = c(0.3, 2.8), 
+             hrzl_lines = list("2" = gpar(lwd = 1, columns = 1:5, col = "#000044"), 
+                      
+                               "9" = gpar(lwd=1)
+                               ),
+             xlog = FALSE,
+             boxsize=0.3,
+             graph.pos=3,
+             colgap=unit(3, 'mm'),
+             graphwidth=unit(34, 'mm'),
+             lwd.ci=2,
+             lwd.xaxis=2,
+             zero = 1,
+             xticks = seq(0.5, 2.5, 0.5), 
+             #mar = unit(rep(10, times = 4), "mm"),
+             col = fpColors(box = "royalblue",
+                            line = "darkblue", 
+                            summary = "royalblue"))
+
+# save plot
+#dev.copy(png,file.path(config$outputs$outputs,"forestplot.png"))
+#dev.off()
+
+```
+
+```{r merge}
+
+# Merge baseline and New model1 analysis tgt
+output<-full_join(routput_baseline,routput_m1,by=c("IDcol"))%>%
+  select(Coefficient.y,HR.x,`95% CI.x`,p.x,HR.y,`95% CI.y`,p.y)%>%
+  `colnames<-`(c("Coefficient","HR","95% CI","p","HR","95% CI","p"))
+
+kable(output,caption = "Main Analyses: Association of potential RFs with BrCa")%>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(" " = 1,  "Baseline Model" = 3, "New Model 1" = 3))
+
+```
+
+```{r}
+
+pool2<-post_long1%>%
+  group_by(.imp)%>%
+  summarise(.,`C-index`=concordance(coxph(formula=as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status) ~ 
+    TEU_BrCa_100k_PRS_quint + TEU_BrCa_313_PRS_quint + TEU_BaC_AgeAtRec + 
+    Imp_BodyFatMass + FSF_MenopauseAge + TEU_Alc_DailyAlcUnits +
+    TEU_FirstBirthAgeCat + TEU_FaH_BrCa +  PhA_METsWkAllAct +
+    G03FA  + BBC_TES_Result +  FSF_PeriodAge + BBC_IGF1_Result +FSF_NLiveBirths+
+    BBC_BUN_Result + Imp_MetRate + BBC_PHOS_Result + Uri_Sodium + BlA_RedBCCount +
+    BBC_AST_Result + Uri_Creat + BlA_MonocytCount + BBC_ALP_Result + 
+    BBC_CRP_Result +
+    GeP_Array + GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + 
+    GeP_PC_6 + GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10")))$concordance)
+
+pool2
+
+```
+
+# New Model 2
+
+Continue from New Model 1, we further added potential interaction, Age*PRS. Age was categorised into 3 groups while PRS kept as continuous.
+
+* New Model 2: BrCa ~ Established  RFs + New RFs + Age*PRS
+
+
+**BrCa 100k PRS**: 
+
+```{r}
+# 100k PRS * age
+varlist <- c(imp_features,"TEU_BrCa_100k_PRS_quint:TEU_BaC_AgeAtRec","GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
+
+rmodel <- with(comp_long1, coxph(as.formula(formula)))
+
+routput_int1 <- printMIresults(df=comp_long1$data, varlist=varlist, modeloutput=summary(pool(rmodel)),
+                              pretty_names=pretty_names, onecol=TRUE, IDcol=FALSE)
+
+kable(routput_int1)%>%
+  kable_styling(bootstrap_options = c("striped", "hover")) 
+
+```
+
+```{r}
+# Overall p-value
+
+
+LR1<-anova(rmodel_m1,rmodel,method = 'D2',use = 'likelihood')
+
+p1<-pretty_pval(LR1$out$`2 ~~ 1`$result[4])
+
+```
+
+Interaction p-value is `r p1`
+
+Visual plots on relative hazard: 
+
+Note: Plot below was based on one random imputation dataset!
+
+
+```{r int plots}
+# Plot (Age*prs)
+
+# Note: For some reason, the formula with paste above doesn't work in this loop!
+
+predictions <- lapply(1:10, function(i) {
+  
+  formula<-as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status) ~ 
+    TEU_BrCa_100k_PRS_quint + TEU_BrCa_313_PRS_quint + TEU_BaC_AgeAtRec + 
+    Imp_BodyFatMass + FSF_MenopauseAge + TEU_Alc_DailyAlcUnits +
+    TEU_FirstBirthAgeCat + TEU_FaH_BrCa +  PhA_METsWkAllAct +
+    G03FA  + BBC_TES_Result +  FSF_PeriodAge + BBC_IGF1_Result +FSF_NLiveBirths+
+    BBC_BUN_Result + Imp_MetRate + BBC_PHOS_Result + Uri_Sodium + BlA_RedBCCount +
+    BBC_AST_Result + Uri_Creat + BlA_MonocytCount + BBC_ALP_Result + 
+    BBC_CRP_Result + TEU_BrCa_100k_PRS_quint:TEU_BaC_AgeAtRec +
+    GeP_Array + GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + 
+    GeP_PC_6 + GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10")
+  
+    m <- coxph(formula, data = complete(comp_long1, action = i))
+    ggpredict(m, terms=c("TEU_BaC_AgeAtRec","TEU_BrCa_100k_PRS_quint"))
+})
+
+# Don't think this pool_predictions is very reliable  
+#pool_pred<-pool_predictions(predictions)
+
+plot(predictions[[1]])+
+  labs(x="Age",y="Relative hazard, exp(Xbeta)",title = "Marginal effect of age on the relative hazard in a Cox model,\n with pointwise 95% CIs",
+       color="BrCa 100k PRS quintiles",caption = "Other continuous variables were kept at sample mean \n while categorical variables were kept at reference level")
+
+```
+
+
+```{r}
+# 313 PRS * age
+varlist <- c(imp_features,"TEU_BrCa_313_PRS_quint:TEU_BaC_AgeAtRec","GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
+
+rmodel <- with(comp_long1, coxph(as.formula(formula)))
+
+routput_int2 <- printMIresults(df=comp_long1$data, varlist=varlist, modeloutput=summary(pool(rmodel)),
+                              pretty_names=pretty_names, onecol=TRUE, IDcol=FALSE)
+kable(routput_int2)%>%
+  kable_styling(bootstrap_options = c("striped", "hover")) 
+
+
+```
+
+```{r}
+# Overall p-value
+
+LR2<-anova(rmodel_m1,rmodel,method = 'D2',use = 'likelihood')
+
+p2<-pretty_pval(LR2$out$`2 ~~ 1`$result[4])
+
+```
+
+Interaction p-value is `r p2`.
+
+Visual plots on relative hazard:
+
+Note: Plot below was based on one random imputation dataset!
+
+```{r}
+# Plot (Age*prs)
+
+predictions <- lapply(1:10, function(i) {
+  
+  formula<-as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status) ~ 
+    TEU_BrCa_100k_PRS_quint + TEU_BrCa_313_PRS_quint + TEU_BaC_AgeAtRec + 
+    Imp_BodyFatMass + FSF_MenopauseAge + TEU_Alc_DailyAlcUnits +
+    TEU_FirstBirthAgeCat + TEU_FaH_BrCa +  PhA_METsWkAllAct +
+    G03FA  + BBC_TES_Result +  FSF_PeriodAge + BBC_IGF1_Result +FSF_NLiveBirths+
+    BBC_BUN_Result + Imp_MetRate + BBC_PHOS_Result + Uri_Sodium + BlA_RedBCCount +
+    BBC_AST_Result + Uri_Creat + BlA_MonocytCount + BBC_ALP_Result + 
+    BBC_CRP_Result + TEU_BrCa_313_PRS_quint:TEU_BaC_AgeAtRec +
+    GeP_Array + GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + 
+    GeP_PC_6 + GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10")
+  
+    m <- coxph(formula, data = complete(comp_long1, action = i))
+    ggpredict(m, terms=c("TEU_BaC_AgeAtRec","TEU_BrCa_313_PRS_quint"))
+})
+
+# Don't think this pool_predictions is very reliable  
+#pool_pred<-pool_predictions(predictions)
+
+plot(predictions[[1]])+
+  labs(x="Age",y="Relative hazard, exp(Xbeta)",title = "Marginal effect of age on the relative hazard in a Cox model,\n with pointwise 95% CIs",
+       color="BrCa 313 PRS quintiles",caption = "Other continuous variables were kept at sample mean \n while categorical variables were kept at reference level")
+
+```
+
+
+
+
+
+
+
+
+
+

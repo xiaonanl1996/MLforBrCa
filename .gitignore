@@ -1,0 +1,67 @@
+# Don't track documents and outputs #
+# They are binary files and we can't easily view diffs on them, so it wouldn't be super useful #
+# We track the code that generates them, so we don't need them #
+########################################################
+**.docx
+**.pdf
+**.html
+**.pptx
+**.tex
+**.png
+**.jpg
+
+# Don't track the data - it's confidential and huge! #
+**.rds
+**.RData
+**.RDataTmp
+**.db
+**.wal
+**duck.db.tmp/
+**.Rcache
+**.feather
+**.buffer
+**/Data/Derived/
+
+# Don't track ML output
+**.json
+**.pkl
+**.npy
+**.sav
+
+# Note excel and csv could be important mapping tables, so worth tracking these! #
+# Except this one which is data#
+ICD10.csv
+# And anything that's .xls probably isn't important (could make this a team convention) #
+**.xls
+
+# Ignore the renv directories#
+##############################
+**/renv/library/
+**/renv/python/
+**/renv/staging/
+
+# Ignore the R project stuff #
+##############################
+**.Rproj.user
+.Rhistory
+.Rproj.user
+.RData
+.Ruserdata
+
+# Ignore archived stuff #
+##############################
+**/archive/
+
+# Ignore R Markdown chunk caches #
+##################################
+Scripts/Stats_Analysis/RMarkdown/**/Cache/
+Scripts/Stats_Analysis/RMarkdown/**_cache/
+*_cache/
+
+# Ignore the memo README #
+##########################
+Data/Cache/README.txt
+
+# Ignore testing files #
+##########################
+Test*

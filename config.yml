@@ -1,0 +1,30 @@
+data:
+ database: "K:/TEU/UKB33952_Data/Data_Downloads/V5_database_duckdb0.3.0/ukb_v5.db"
+ portal:
+  HES: "K:/TEU/UKB33952_Data/Data_Portal/HES_diagnoses/20210812"
+  deaths: "K:/TEU/UKB33952_Data/Data_Portal/Death_Registry/20210812"
+ derived: "Data/Derived"
+ analysed: "Data/Analysed"
+ prs: 
+  brca313: "K:/TEU/UKB_Genetic_Data/PRS_Pipeline/prs/projects/brca313-mavaddat2018/outputs"
+  brca100k: "K:/TEU/UKB_Genetic_Data/PRS_Pipeline/prs/projects/brca100k-fritsche2020/outputs"
+cleaning:
+ withdrawals: "K:/TEU/UKB33952_Data/Data_Downloads/Withdrawals/w33952_20210809.csv"
+ renaming: "K:/TEU/UKB33952_Data/Data_Dictionary/Renaming_List_UPDATE_Sep2021_TEU.csv"
+ coding: "K:/TEU/UKB33952_Data/Data_Dictionary/Mappings/Encoding_files"
+ mapping: "K:/TEU/UKB33952_Data/Data_Dictionary/Mappings/Analysis_codings_xlsx/BrstCancer"
+outputs:
+ figures: "Scripts/Stats_Analysis/RMarkdown/Figures"
+ flowcharts: "Scripts/Stats_Analysis/Flowcharts"
+ descriptives: "K:/TEU/MLforBrCa/Stats_Outputs/Descriptives/"
+ outputs: "K:/TEU/MLforBrCa/Stats_Outputs/"
+explore: "K:/TEU/MLforBrCa/Explore/"
+functions:
+ JC: "Scripts/Stats_Analysis/JCfunctions.R"
+ general: "K:/TEU/TEU_Members/Xiaonan_Liu/Projects/PRSonCholstrl/Scripts/Stats_Analysis/General_Func/JCfunctions_XL.R"
+ flowchart: "K:/TEU/TEU_Members/Xiaonan_Liu/Projects/PRSonCholstrl/Scripts/Stats_Analysis/General_Func/FlowChart_pop.R"
+ descriptive: "K:/TEU/TEU_Members/Xiaonan_Liu/Projects/PRSonCholstrl/Scripts/Stats_Analysis/General_Func/DescrpStats.R"
+scripts:
+ cleaning: "Scripts/Data_Management/Scripts_Cleaning"
+ processing: "Scripts/Data_Management/Scripts_Processing"
+
