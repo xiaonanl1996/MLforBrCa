@@ -589,5 +589,377 @@ ggplot(tab, aes(fill=factor(Levels,levels = c('Q1: Lowest level','Q2','Q3','Q4',
 
 ```
 
+# Exclude first 2 yrs FU (Training)
+
+To further investigate blood count, biochemistry, urine assays variables, we would like to restrict our analysis population to people with 2 or more years follow up and see if they are still significant. The logic behind this is to see if significance were due to reverse causation. 
+
+
+Out of `r nrow(tot_train)` post-menopausal women, there were `r tot_train%>%filter(TEU_BrCa_time>=2)%>%nrow` with 2 or more years follow up.
+
+```{r imp features}
+
+imp_features<-c(
+  xgboost_SHAP$Var_name[c(1:5,7:20)],
+  # Because FaH of BrCa var name is in a different format
+  "TEU_FaH_BrCa",
+  # established RFs
+  "PhA_METsWkAllAct", "G03FA","FSF_PeriodAge",
+   "FSF_NLiveBirths" 
+)
+
+
+# Replace Father death age and age at first birth with the manipulated ones 
+
+imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
+imp_features=replace(imp_features,imp_features=="TEU_Alc_WeeklyAlcUnits","TEU_Alc_DailyAlcUnits")
+imp_features=replace(imp_features,imp_features=="TEU_BrCa_100k_PRS","TEU_BrCa_100k_PRS_quint")
+imp_features=replace(imp_features,imp_features=="TEU_BrCa_313_PRS","TEU_BrCa_313_PRS_quint")
+
+```
+
+
+```{r SA New Model 1}
+
+# Transform to long first 
+post.long <- mice::complete(comp_long1,"long",include = T)
+
+post.long.sub <- post.long[which(post.long$TEU_BrCa_time >=2),]
+# Post-hoc: Scale variables with HR CI (1,1) to show wider CI in forest plot
+
+post.long.sub<-post.long.sub%>%
+  mutate(
+    TEU_Alc_DailyAlcUnits=TEU_Alc_WeeklyAlcUnits/7,
+    )%>%
+  group_by(.imp)%>%
+  mutate(
+    # Scale variables by mean and sd within each imp
+    Imp_MetRate=scale_this(Imp_MetRate),
+    Uri_Sodium=scale_this(Uri_Sodium),
+    Uri_Creat=scale_this(Uri_Creat),
+    BBC_ALP_Result=scale_this(BBC_ALP_Result),
+    PhA_METsWkAllAct=scale_this(PhA_METsWkAllAct),
+    TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')),
+    TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score'))
+  )
+
+
+# Create mids object
+imp_post_sub <- as.mids(post.long.sub)
+
+##
+varlist <- c(imp_features,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
+
+rmodel <- with(imp_post_sub, coxph(as.formula(formula)))
+
+routput_post_sub <- printMIresults(df=imp_post_sub$data, varlist=varlist, modeloutput=summary(pool(rmodel)),
+                              pretty_names=pretty_names, onecol=TRUE, IDcol=FALSE)
+
+pander(routput_post_sub)
+```
+
+
+```{r Diag,eval=FALSE}
+
+pha_plots<-list() #save PHA plot for each imputation
+vifs<-list() #save multicollinearity results
+
+imp1=imp_post_sub
+
+for (i in 1:imp1$m) {
+  ## 1. PHA
+  pha_plots[[i]]<-ggcoxzph(cox.zph(rmodel$analyses[[i]]))
+  
+  ## 2. Multicollinearity
+  formula<-as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status) ~ 
+    TEU_BrCa_100k_PRS_quint + TEU_BrCa_313_PRS_quint + TEU_BaC_AgeAtRec + 
+    Imp_BodyFatMass + FSF_MenopauseAge + TEU_Alc_DailyAlcUnits +
+    TEU_FirstBirthAgeCat + TEU_FaH_BrCa +  PhA_METsWkAllAct +
+    G03FA  + BBC_TES_Result +  FSF_PeriodAge + BBC_IGF1_Result +FSF_NLiveBirths+
+    BBC_BUN_Result + Imp_MetRate + BBC_PHOS_Result + Uri_Sodium + BlA_RedBCCount +
+    BBC_AST_Result + Uri_Creat + BlA_MonocytCount + BBC_ALP_Result + 
+    BBC_CRP_Result +
+    GeP_Array + GeP_PC_1 + GeP_PC_2 + GeP_PC_3 + GeP_PC_4 + GeP_PC_5 + 
+    GeP_PC_6 + GeP_PC_7 + GeP_PC_8 + GeP_PC_9 + GeP_PC_10")
+  
+  vifs[[i]]<-rms::vif(cph(formula,data=complete(imp_post_sub,i)))
+  cat("Imputation",i,", Any VIF above>10:",any(vifs[[i]]>10),'\n')
+  
+}
+
+# Use shinyapp for better visualisation
+
+choices = 1:imp1$m
+
+names(choices) <- paste("Imputation",1:imp1$m)
+shinyApp(
+  ui = fluidPage(
+    titlePanel("PHA plot on each imputation"),
+    sidebarPanel(
+      selectInput("plot", "Choose plot:", choices=choices),
+      hr()),
+      #helpText("Trail plots")),
+    plotOutput("mainplot")
+  ),
+  server = function(input, output) {
+    output$mainplot<-renderPlot({
+      i<- as.integer(input$plot)
+      pha_plots[[i]]
+    }, height = 1000, width = 2000)
+  }
+)
+
+
+
+```
+
+```{r forestplot,eval=FALSE}
+
+# Change order of FaH so corresponding to the SHAP order
+present=setdiff(imp_features,"TEU_FaH_BrCa")
+present <- append(present, values = "TEU_FaH_BrCa", after = match("TEU_Alc_DailyAlcUnits", present) - 1)  
+
+# Add unit to features 
+pretty_names$BBC_TES_Result="Testosterone,nmol/L"
+pretty_names$FSF_MenopauseAge="Age at menopause,years"
+pretty_names$TEU_Alc_DailyAlcUnits="Daily alcohol intake,units"
+pretty_names$BBC_BUN_Result="Plasma urea,mmol/L"
+pretty_names$Imp_MetRate="Basal metabolic rate,KJ"
+pretty_names$BBC_PHOS_Result="Plasma phosphate,mmol/L"
+pretty_names$BBC_IGF1_Result="IGF-1,nmol/L"
+pretty_names$Uri_Sodium="Sodium in urine,mmol/L"
+pretty_names$BlA_RedBCCount="Red blood cell count,10^12/L"
+pretty_names$BBC_AST_Result="Aspartate aminotransferase,U/L"
+pretty_names$TEU_FirstBirthAgeCat="Age at first birth,years (Categorical)"
+pretty_names$Uri_Creat="Creatinine (enzymatic) in urine,mcmol/L"
+pretty_names$BlA_MonocytCount="Monocytes count,10^9/L"
+pretty_names$Imp_BodyFatMass="Whole body fat mass,Kg"
+pretty_names$BBC_ALP_Result="Alkaline phosphatase,U/L"
+pretty_names$BBC_CRP_Result="C-reactive protein,mg/L"
+pretty_names$FSF_PeriodAge="Age at menarche,years"
+pretty_names$PhA_METsWkAllAct="Summed MET minutes per week"
+pretty_names$TEU_BaC_AgeAtRec="Age at recruitment,years"
+
+
+m1_forplot <- printMIresults(df=imp_post_sub$data, varlist=present, modeloutput=summary(pool(rmodel)),
+                                pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE,forplot = TRUE)
+
+cox_m1<-m1_forplot%>%
+  # Create HR (95% CI)
+  mutate(HR_CI=ifelse(is.na(L_CI),NA_character_,paste0(pretty_dp(HR_num,2)," ",pretty_confint(L_CI, U_CI, dp=2))))
+
+cox_m1$HR_CI[is.na(cox_m1$HR_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- "1"
+cox_m1$HR_num[is.na(cox_m1$HR_num) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+cox_m1$L_CI[is.na(cox_m1$L_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+cox_m1$U_CI[is.na(cox_m1$U_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+
+# Hacky tweak so the cox model names correpsond to SHAP names
+cox_m1$IDcol[cox_m1$IDcol=="**$$PRS_{120k}$$ quintiles**"]="TEU_BrCa_100k_PRS"
+cox_m1$IDcol[cox_m1$IDcol=="**$$PRS_{313}$$ quintiles**"]="TEU_BrCa_313_PRS"
+cox_m1$IDcol[cox_m1$IDcol=="**Family history of BrCa**"]="TEU_FaH_BrCa_Family history of BrCa"
+cox_m1$IDcol[cox_m1$IDcol=="**Age at first birth,years (Categorical)**"]="TEU_FirstBirthAge"
+cox_m1$IDcol[cox_m1$IDcol=="TEU_Alc_DailyAlcUnits"]="TEU_Alc_WeeklyAlcUnits"
+
+# Add space for levels of categorical vars
+cox_m1<-cox_m1%>%
+  mutate(Coefficient=ifelse(!str_detect(Coefficient,fixed("**")),paste0("       ",Coefficient),Coefficient))
+
+
+# Prepare SHAP 
+
+shap<-xgboost_SHAP[1:20,]%>%
+  select(Var_name,SHAP)%>%
+  #mutate(norm_SHAP=(SHAP-min(SHAP))/(max(SHAP)-min(SHAP)))%>%
+  mutate(SHAP_pretty=pretty_dp(SHAP,2))
+
+#shap$Var_name[shap$Var_name=="TEU_FaH_BrCa_Family history of BrCa"]="TEU_FaH_BrCa"
+#shap$Var_name[shap$Var_name=="TEU_BrCa_100k_PRS"]="TEU_BrCa_100k_PRS_quintiles"
+#shap$Var_name[shap$Var_name=="TEU_BrCa_313_PRS"]="TEU_BrCa_313_PRS_quintiles"
+#shap$Var_name[shap$Var_name=="TEU_FirstBirthAge"]="TEU_FirstBirthAgeCat"
+#shap$Var_name[shap$Var_name=="TEU_Alc_WeeklyAlcUnits"]="TEU_Alc_DailyAlcUnits"
+#shap$Var_name2=preparecoefflist_2col(df=comp_long1$data,varname = shap$Var_name,pretty_names = pretty_names)
+
+# Left join 
+
+cox_shap<-left_join(cox_m1,shap,by=c("IDcol"="Var_name"))%>%
+  select(Coefficient,SHAP_pretty,HR_CI,p,HR_num,L_CI,U_CI)%>%
+  mutate(summary=FALSE)%>%
+  mutate(Coefficient=str_remove_all(Coefficient,fixed("**")))%>%
+  add_row(Coefficient = "Features", SHAP_pretty="SHAP Value",HR_CI="HR (95% CI)",p="p-value", summary=TRUE,.before = 1)%>%
+  rename(mean=HR_num,lower=L_CI,upper=U_CI)
+  
+
+
+# initialize plot
+#tiff(file.path(config$outputs$outputs,"forestplot_A.tiff"),  units = "in", width = 7, height = 25, res = 300)
+
+# make plot
+
+tabletext <- list(
+ c("Features",append(list(expression(PRS["120k"]~quintiles)),cox_shap$Coefficient[3:7]),append(list(expression(PRS["313"]~quintiles)),cox_shap$Coefficient[9:21])),
+  c(list(expression(SHAP["ma"])),cox_shap$SHAP_pretty[2:21]),
+  cox_shap$HR_CI[1:21],
+  cox_shap$p[1:21]
+)
+
+
+
+cox_shap[1:21,]%>%
+  forestplot(labeltext = tabletext, 
+             is.summary = summary,
+             clip = c(0.3, 2.8), 
+             hrzl_lines = list("2" = gpar(lwd = 1, columns = 1:5, col = "#000044") 
+                               #"3" = gpar(lwd=1),
+                               #"9" = gpar(lwd=1),
+                               #"18" = gpar(lwd=1)
+                               ),
+             xlog = FALSE,
+             boxsize=0.3,
+             graph.pos=3,
+             colgap=unit(3, 'mm'),
+             graphwidth=unit(34, 'mm'),
+             lwd.ci=2,
+             lwd.xaxis=2,
+             zero = 1,
+             xticks = seq(0.5, 2.5, 0.5), 
+             #mar = unit(rep(10, times = 4), "mm"),
+             col = fpColors(box = "royalblue",
+                            line = "darkblue", 
+                            summary = "royalblue"))
+
+
+# save plot
+#dev.copy(png,file.path(config$outputs$outputs,"forestplot.png"))
+#dev.off()
+
+## Too long, has to be split into 2
+#tiff(file.path(config$outputs$outputs,"forestplot_B.tiff"),  units = "in", width = 13, height = 50, res = 300)
+
+tabletext <- list(
+ cox_shap$Coefficient[c(1,22:nrow(cox_shap))],
+  c(list(expression(SHAP["ma"])),cox_shap$SHAP_pretty[22:nrow(cox_shap)]),
+  cox_shap$HR_CI[c(1,22:nrow(cox_shap))],
+  cox_shap$p[c(1,22:nrow(cox_shap))]
+)
+
+
+
+# make plot
+cox_shap[c(1,22:nrow(cox_shap)),]%>%
+  forestplot(labeltext = tabletext,
+             is.summary = summary,
+             clip = c(0.3, 2.8), 
+             hrzl_lines = list("2" = gpar(lwd = 1, columns = 1:5, col = "#000044")
+                      
+                               #"9" = gpar(lwd=1)
+                               ),
+             xlog = FALSE,
+             boxsize=0.3,
+             graph.pos=3,
+             colgap=unit(3, 'mm'),
+             graphwidth=unit(34, 'mm'),
+             lwd.ci=2,
+             lwd.xaxis=2,
+             zero = 1,
+             xticks = seq(0.5, 2.5, 0.5), 
+             #mar = unit(rep(10, times = 4), "mm"),
+             col = fpColors(box = "royalblue",
+                            line = "darkblue", 
+                            summary = "royalblue"))
+
+
+```
+
+
+# Harrell's C-index on test data
+
+We need to fit the model using training data and then using the coefficients (i.e. betas) to predict on test data then obtain the Harrell's C-index.
+
+```{r training baseline}
+
+eRFs <- c("TEU_BrCa_100k_PRS_quint","TEU_BrCa_313_PRS_quint","TEU_BaC_AgeAtRec","Imp_BodyFatMass","FSF_MenopauseAge","TEU_Alc_DailyAlcUnits","TEU_FirstBirthAgeCat","TEU_FaH_BrCa" ,  "PhA_METsWkAllAct" ,"G03FA", "FSF_PeriodAge","BBC_IGF1_Result" ,"BBC_TES_Result", "FSF_NLiveBirths" ,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(eRFs, collapse="+"))
+
+rmodel <- with(comp_long1, coxph(as.formula(formula)))
+
+pooled <- pool(rmodel)
+
+# Copy one of the fitted models fit to
+#   one of the imputed datasets
+pooled_1st = rmodel$analyses[[1]]
+# Replace the fitted coefficients with the pooled
+#   estimates (need to check they are replaced in
+#   the correct order)
+pooled_1st$coefficients = summary(pooled)$estimate
+
+```
+
+```{r training new model 1}
+
+varlist <- c(imp_features,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
+
+rmodel_m1 <- with(comp_long1, coxph(as.formula(formula)))
+
+pooled_m1 <- pool(rmodel_m1)
+
+# Copy one of the fitted models fit to
+#   one of the imputed datasets
+pooled_m1_1st = rmodel_m1$analyses[[1]]
+# Replace the fitted coefficients with the pooled
+#   estimates (need to check they are replaced in
+#   the correct order)
+pooled_m1_1st$coefficients = summary(pooled_m1)$estimate
+
+```
+
+
+
+```{r}
+# transfer test to long
+test_long <- complete(comp_long1_test,"long")
+
+test_long <- test_long%>%
+  mutate(baseline_pi=predict(pooled_1st,newdata = test_long,type = 'lp'),
+         m1_pi=predict(pooled_m1_1st,newdata=test_long,type='lp'))
+
+
+```
+
+
+```{r}
+
+
+C_index=test_long%>%group_by(.imp)%>%
+  summarise(., C_index_baseline=survConcordance(Surv(TEU_BrCa_time,TEU_BrCa_status)~baseline_pi)$concordance,
+            C_index_m1=survConcordance(Surv(TEU_BrCa_time,TEU_BrCa_status)~m1_pi)$concordance)
+
+pander(as.data.frame(C_index),caption = "Harrell's C-index of 2 models on test data")
+
+```
+
+Median of C-index for baseline model is `r median(C_index$C_index_baseline)` and for new model 1 is `r median(C_index$C_index_m1)`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
