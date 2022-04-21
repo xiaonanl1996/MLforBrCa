@@ -81,7 +81,7 @@ pretty_func <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HE
 
 # Introduction
 
-This report documents process of feature inspection (e.g. correlation elimination) and multiple imputation on training data.
+This report documents process of feature inspection (e.g. correlation elimination) and multiple imputation on training data and test data. Note: This Rmd is not for knitting but for running code chunks interactively.
 
 # Features Inspection
 
@@ -446,15 +446,167 @@ save(comp_long1_scaled,file=file.path(config$data$derived,'imp_post_derived_scal
 ```
 
 
+# Multiple Imputation on test data
+
+```{r}
+
+
+imp_features<-c(
+  xgboost_SHAP$Var_name[c(1:5,7:20)],
+  # Because FaH of BrCa var name is in a different format
+  "TEU_FaH_BrCa",
+  # established RFs
+  "BSM_BMI", "PhA_METsWkAllAct", "G03FA","FSF_PeriodAge",
+  "FSF_NLiveBirths" 
+)
+
+
+# Remove whole body fat mass due to high cor with BMI
+imp_features<-imp_features[!grepl("BSM_BMI",imp_features)]
+
+
+# Categorise first birth age 
+tot_test<-tot_test%>%
+  mutate(TEU_FirstBirthAgeCat=factor(case_when(
+    # If no live births given, assign "No births"
+    FSF_NLiveBirths==0 ~ "No Births",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge<20 ~ "<20",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=20 & TEU_FirstBirthAge<30 ~ "20-30",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=30 & TEU_FirstBirthAge<40 ~ "30-40",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=40 ~ ">=40",
+    TRUE ~ NA_character_
+  ),levels=c("No Births","<20","20-30","30-40",">=40"))
+  
+  )
+
+# Replace Father death age and age at first birth with the manipulated ones 
+
+imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
+
+# Check missingness
+tot_test%>%select(all_of(imp_features))%>%miss_var_summary()
+
+
+```
+
+
+```{r prep}
+
+# Prepare MI data
+
+MI_data=tot_test[,c("TEU_BrCa_status","TEU_BrCa_time",
+                     imp_features,
+                     "GeP_Array",paste0("GeP_PC_",1:10)
+)]
+
+
+# Need to Scale up PRS
+
+MI_data=MI_data%>%
+  mutate(TEU_BrCa_100k_PRS=TEU_BrCa_100k_PRS*115300*2,
+         TEU_BrCa_313_PRS=TEU_BrCa_313_PRS*305*2)
+
+```
+
+```{r MI test}
+ini <- mice(MI_data,maxit = 0,print=FALSE)
+post <- ini$post
+post["TEU_FirstBirthAgeCat"] <- "imp[[j]][data$FSF_NLiveBirths[!r[,j]]==0,i] <- 'No Births'"
+post["FSF_NLiveBirths"] <- "imp[[j]][data$TEU_FirstBirthAgeCat[!r[,j]]=='No Births',i] <- 0"
+
+pred <- quickpred(MI_data,include = c("TEU_BrCa_status", "TEU_BrCa_time",
+                                      "TEU_BrCa_100k_PRS","TEU_BrCa_313_PRS",
+                                      "TEU_BaC_AgeAtRec","Imp_BodyFatMass","PhA_METsWkAllAct",
+                                      "TEU_Alc_WeeklyAlcUnits","TEU_FaH_BrCa",
+                                      "G03FA","FSF_PeriodAge","FSF_NLiveBirths",
+                                      "TEU_FirstBirthAgeCat"))
+
+imp_post_test<-mice(MI_data,post=post,pred=pred,maxit = 20,seed = 100,m=10) 
+
+save(imp_post_test,file=file.path(config$data$derived,'imp_post_test.rds'))
+
+```
+
+```{r}
+plot(imp_post_test)
+
+# Extract completed data after MI
+
+imp1=imp_post_test
+
+#MI_data=MI_data_post;imp1=imp_post
+
+
+long1 <- complete(imp1,"long") 
+long1$.imp <- as.factor(long1$.imp)
 
 
 
+num_plot <- list() #Save the density plots
+factor_tb <- list() # Save the freq tables 
+
+# Variables with missing data
+missing_var=MI_data%>%miss_var_summary()%>%filter(n_miss!=0)%>%pull(variable)
+
+for (var in missing_var){
+  
+  if (is.numeric(MI_data[[var]])){
+    # If numeric, plot density between observed and imputed 
+    
+    #long1 <- cbind(long1, ind.na=is.na(imp1$data[[var]]))
+    long1 <- long1 %>%
+      mutate(ind.na=rep(is.na(imp1$data[[var]]),10))
+    
+    p<-densityplot(~long1[[var]]|.imp, data=long1, group=ind.na, plot.points=FALSE,
+                   ref=TRUE, xlab=paste0(var),scales=list(y=list(draw=F)),
+                   par.settings=simpleTheme(col.line=rep(c("blue","red"))), 
+                   auto.key = list(columns=2,text=c("Observed","Imputed")))
+    
+    num_plot[[var]]=p
+    
+  }else{
+    # If factor, produce freq table of each level between observed and imputed 
+    long1 <- long1 %>%
+      mutate(ind.na=rep(ifelse(is.na(imp1$data[[var]]),'Imputed','Observed'),10))
+    
+    factor_tb[[var]] <- lapply(unique(long1$.imp), function(i) 
+      prop.table(table(long1%>%filter(.imp==i)%>%pull(ind.na),
+                       long1%>%filter(.imp==i)%>%pull(var)), margin = 1)*100)
+    
+  }
+}
+
+```
 
 
+```{r}
+# Scale alcohol per week to per day
+# Scale PRS to percentiles
+# Age into 3 groups for later inspection 
+
+long1<-complete(imp_post_test,"long",include=TRUE)
+
+comp_long1<-long1%>%
+  mutate(
+    TEU_Alc_DailyAlcUnits=TEU_Alc_WeeklyAlcUnits/7,
+    TEU_BaC_AgeCat=cut(TEU_BaC_AgeAtRec,
+                       breaks = c(40, 53, 60, 70),
+                       labels = c("[40,53)", "[53,60)", "[60,70)"),
+                       right = FALSE
+    ))%>%
+  group_by(.imp)%>%
+  mutate(TEU_BrCa_100k_PRS_percent=Percentile(TEU_BrCa_100k_PRS),
+         TEU_BrCa_313_PRS_percent=Percentile(TEU_BrCa_313_PRS),
+         TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')),
+         TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')))
 
 
+comp_long1_test<-as.mids(comp_long1)
 
 
+save(comp_long1_test,file=file.path(config$data$derived,'imp_post_test_derived.rds'))
+
+```
 
 
 
