@@ -133,6 +133,22 @@ TEU_BaC_AgeAtRec <- function() {
   )
 }
 
+TEU_BaC_AgeCat <- function() {
+  list(
+    name = "TEU_BaC_AgeCat",
+    source = "TEU_BaC_AgeAtRec",
+    mapper = FN_buckets(
+      breaks = c(40, 50, 60, 70),
+      labels = c("40-49", "50-59", "60-69"),
+      right = FALSE
+    ),
+    post_exclusion = FALSE,
+    display_name = "Age at recruitment, years",
+    description = "Categorised age in years"
+  )
+}
+
+
 TEU_BlP_SBP.0.0 <- function() {
   list(
     name = "TEU_BlP_SBP.0.0",

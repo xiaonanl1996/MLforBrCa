@@ -1,0 +1,134 @@
+---
+title: "Demo for running dataset derivation system"
+author: "Xiaonan Liu"
+date: "2023-02-27"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(yaml)
+library(rsample)
+library(arrow)
+library(naniar)
+library(rsvg)
+library(feather)
+library(here)
+library(Matrix)
+library(xgboost)
+library(rlist)
+
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+
+
+```
+
+Key points: 
+* Don't knit this.
+* duckdb version. Mention renv.lock
+* Introduce "basic_functions.R" and "derivation_objects.R".
+
+```{r}
+#install version 0.6.2 duckdb
+
+require(remotes)
+install_version("duckdb", version = "0.6.2", repos = "http://cran.us.r-project.org")
+```
+
+# Raw data
+
+```{r}
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+data <- DBfunc$DB_extract(extract_cols = c(
+  "ID", "Rec_DateAssess.0.0","BaC_Sex.0.0",
+  paste0("CaR_DiagDate.", seq(0, 16, by=1), ".0")
+)
+)
+
+```
+
+
+# Stage 1: Extract common variables
+
+`derive_variables` was stored in "dataset_generator.R".
+
+```{r}
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+excl <- list(initial=0)
+
+# 1. Extract/Save data
+data <-
+  #evalWithMemoization(
+  derive_variables(
+    database = config$data$database,
+    field_definitions = TEU_SPECS$TEUvars_common,
+    exclusions = function(x){x}
+    #dictionary = "MLforBrCa.html"
+    #),
+    #key = c(TEU_SPECS$BrCa_PRS, exclusions)
+  )
+```
+
+We could apply exclusion criteria
+
+```{r}
+# Exclusion Criteria
+exclusions <- function(data) {
+  
+  excl$initial <<- nrow(data)
+  
+  # Age
+  data<-data%>%filter(!(!is.na(TEU_BaC_AgeAtRec) & TEU_BaC_AgeAtRec<40 | TEU_BaC_AgeAtRec>=70))
+  excl$agewithin<<-nrow(data)
+
+  # Exclude males
+  data <- data[data$BaC_Sex=="Female",]
+  
+  excl$males <<- nrow(data)
+  
+  return(data)
+}
+
+excl <- list(initial=0)
+
+# 1. Extract/Save data
+data <-
+  #evalWithMemoization(
+  derive_variables(
+    database = config$data$database,
+    field_definitions = TEU_SPECS$TEUvars_common,
+    exclusions = exclusions
+    #dictionary = "MLforBrCa.html"
+    #),
+    #key = c(TEU_SPECS$BrCa_PRS, exclusions)
+  )
+```
+
+Demonstrate deriving a variable (e.g. categorise some variables?)
+
+Spend sometime talk through the basic functions.
+
+# Stage 2: Outcome
+
+See Figure 1 in MLforBrCa analysis plan.
+
+[Maybe not]: Mention cache.
+
+
+# Stage 3: MLforBrCa
+
+See "InitialExtraction.Rmd".
+
+
+
+
+
+

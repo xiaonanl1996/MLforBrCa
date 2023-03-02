@@ -1,5 +1,5 @@
 data:
- database: "K:/TEU/UKB33952_Data/Data_Downloads/V5_database_duckdb0.3.0/ukb_v5.db"
+ database: "K:/TEU/UKB33952_Data/Data_Downloads/V6_database_duckdb0.6.2/ukb_v6.db"
  portal:
   HES: "K:/TEU/UKB33952_Data/Data_Portal/HES_diagnoses/20210812"
   deaths: "K:/TEU/UKB33952_Data/Data_Portal/Death_Registry/20210812"
