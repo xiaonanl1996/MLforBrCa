@@ -1,0 +1,337 @@
+---
+title: 'MLforBrCa: Model performance'
+author: "Xiaonan Liu"
+date: "2023-04-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,fig.pos = 'H')
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(grid)
+library(dplyr)
+library(survival)
+library(survminer)
+library(naniar)
+library(summarytools)
+library(rsample)      # data splitting 
+library(gbm)          # basic implementation
+library(caret)        # an aggregator package for performing many machine learning models
+library(pdp)          # model visualization
+library(lime)         # model visualization
+library(vip)          # Feature importance visualisation
+library(rms)
+library(mice)
+library(pander)
+library(arsenal)
+library(gtools)
+library(ggeffects)
+#library(mitml)
+library(forestplot)
+library(rcompanion)
+library(splines) #rcs
+library(riskRegression)
+library(glmnet)
+library(plotmo) # for plot_glmnet
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+knitr::opts_knit$set(root.dir = here::here())
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions$JC))
+#source(here::here(config$functions$descriptive))
+
+#tot<-readRDS(here::here(file.path(config$data$derived,"tot_20220124.rds")))
+tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
+tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
+
+xgboost_SHAP<-read.csv(here::here(file.path(config$outputs$outputs,"ML coxloss/XGBoost_Cox_SHAP.csv")))
+
+
+load(here::here(file.path(config$data$derived,"Cox/imp_post_derived.rds")))
+
+load(here::here(file.path(config$data$derived,"Cox/imp_post_test_derived.rds")))
+
+```
+
+
+```{r Data extraction,include=FALSE}
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+pretty_names <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type="list")
+pretty_func <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type = "function")
+
+
+pretty_names$TEU_BrCa_100k_PRS="$$PRS_{120k}$$"
+pretty_names$TEU_BrCa_313_PRS="$$PRS_{313}$$"
+pretty_names$G03FA="HRT user"
+
+# Add unit to features 
+pretty_names$BBC_TES_Result="Testosterone,nmol/L"
+pretty_names$FSF_MenopauseAge="Age at menopause,years"
+pretty_names$TEU_Alc_DailyAlcUnits="Daily alcohol intake,units"
+pretty_names$BBC_BUN_Result="Plasma urea,mmol/L"
+pretty_names$Imp_MetRate="Basal metabolic rate,KJ"
+pretty_names$BBC_PHOS_Result="Plasma phosphate,mmol/L"
+pretty_names$BBC_IGF1_Result="IGF-1,nmol/L"
+pretty_names$Uri_Sodium="Sodium in urine,mmol/L"
+pretty_names$BlA_RedBCCount="Red blood cell count,10^12/L"
+pretty_names$BBC_AST_Result="Aspartate aminotransferase,U/L"
+pretty_names$TEU_FirstBirthAgeCat="Age at first birth,years (Categorical)"
+pretty_names$Uri_Creat="Creatinine (enzymatic) in urine,mcmol/L"
+pretty_names$BlA_MonocytCount="Monocytes count,10^9/L"
+pretty_names$Imp_BodyFatMass="Whole body fat mass,Kg"
+pretty_names$BBC_ALP_Result="Alkaline phosphatase,U/L"
+pretty_names$BBC_CRP_Result="C-reactive protein,mg/L"
+pretty_names$FSF_PeriodAge="Age at menarche,years"
+pretty_names$PhA_METsWkAllAct="Summed MET minutes per week"
+pretty_names$TEU_BaC_AgeAtRec="Age at recruitment,years"
+pretty_names$BBC_GGT_Result="Gamma glutamyltransferase,U/L"
+pretty_names$BSM_BMI="BMI, kg/m^2"
+pretty_names$`TEU_FaH_BrCaNo family history of BrCa`="No family history of breast cancer"
+```
+
+# Model performance
+
+We assess C-index and Brier score.
+
+Correction on scaling: We previously used scaled version for prediction and assessing model performance. In details, we fit the model using scaled training data, then we scale the test data and compute prediction and assess model performance. The problem is we should use the summary stats from training data to scale the test data. But then the problem gets more complex when we multiple imputed both training and test data. Problems include which mean of the training data do we use? 
+
+To simplify this problem, we should just fit the model using the original (i.e. not scaled) training data and use the betas to make predictions of the original test data. 
+
+The only reason why we scaled training data was for presentation purpose (e.g. some HR were 1).
+
+Below are based on original data, not scaled data.
+
+```{r Baseline model}
+# Note that both PRS in comp_long1 were in standardised format.
+eRFs <- c("TEU_BrCa_100k_PRS","TEU_BrCa_313_PRS","TEU_BaC_AgeAtRec","BSM_BMI","FSF_MenopauseAge","TEU_Alc_DailyAlcUnits","TEU_FirstBirthAgeCat","TEU_FaH_BrCa" ,  "PhA_METsWkAllAct" ,"G03FA", "FSF_PeriodAge","BBC_IGF1_Result" ,"BBC_TES_Result", "FSF_NLiveBirths" ,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(eRFs, collapse="+"))
+
+rmodel <- with(comp_long1, coxph(as.formula(formula)))
+
+```
+
+```{r}
+imp_features<-c(
+  xgboost_SHAP$Var_name[c(1:8,10:20)],
+  # Because FaH of BrCa var name is in a different format
+  "TEU_FaH_BrCa",
+  # established RFs
+  "BSM_BMI", "G03FA","FSF_PeriodAge",
+   "FSF_NLiveBirths" 
+)
+
+
+imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
+
+# Transform the variables fitted in the model
+imp_features=replace(imp_features,imp_features=="TEU_Alc_WeeklyAlcUnits","TEU_Alc_DailyAlcUnits")
+
+```
+
+
+```{r Augmented Cox model}
+varlist <- c(imp_features,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula_m1 <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
+
+rmodel_m1_training <- with(comp_long1, coxph(as.formula(formula_m1)))
+
+```
+
+
+## Training performance
+
+### C-index
+
+C-index of baseline and augmented Cox models:
+
+```{r}
+
+post_long1<-complete(comp_long1,"long")
+
+pool<-post_long1%>%
+  group_by(.imp)%>%
+  summarise(.,C_index_baseline=concordance(coxph(formula=as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status)~ TEU_BrCa_100k_PRS+TEU_BrCa_313_PRS+TEU_BaC_AgeAtRec+BSM_BMI+FSF_MenopauseAge+TEU_Alc_DailyAlcUnits+TEU_FirstBirthAgeCat+TEU_FaH_BrCa+PhA_METsWkAllAct+G03FA+FSF_PeriodAge+BBC_IGF1_Result+BBC_TES_Result+FSF_NLiveBirths+GeP_Array+GeP_PC_1+GeP_PC_2+GeP_PC_3+GeP_PC_4+GeP_PC_5+GeP_PC_6+GeP_PC_7+GeP_PC_8+GeP_PC_9+GeP_PC_10")))$concordance)
+
+```
+
+Training concordance index of baseline model (median of C-index from each imputation dataset): `r median(pool$C_index_baseline)`
+
+```{r}
+
+post_long1<-complete(comp_long1,"long")
+
+pool2<-post_long1%>%
+  group_by(.imp)%>%
+  summarise(.,C_index=concordance(coxph(formula=as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status)~ TEU_BrCa_313_PRS+TEU_BrCa_100k_PRS+TEU_BaC_AgeAtRec+BBC_TES_Result+FSF_MenopauseAge+BBC_IGF1_Result+BBC_BUN_Result+TEU_Alc_DailyAlcUnits+Imp_MetRate+TEU_FirstBirthAgeCat+BBC_AST_Result+BBC_PHOS_Result+BBC_CRP_Result+Uri_Sodium+BlA_RedBCCount+BBC_GGT_Result+Uri_Creat+BBC_ALP_Result+PhA_METsWkAllAct+TEU_FaH_BrCa+BSM_BMI+G03FA+FSF_PeriodAge+FSF_NLiveBirths+GeP_Array+GeP_PC_1+GeP_PC_2+GeP_PC_3+GeP_PC_4+GeP_PC_5+GeP_PC_6+GeP_PC_7+GeP_PC_8+GeP_PC_9+GeP_PC_10")))$concordance)
+
+```
+
+Training concordance index of new model (median of C-index from each imputation dataset): `r median(pool2$C_index)`
+
+### Brier score  
+
+We compute the Brier score at 10 years.
+
+```{r Brier training}
+
+post_long1<-complete(comp_long1,"long")
+
+#basehaz_tot<-list()
+Brier_training<-list()
+for (i in 1:10) {
+  
+  each_imp<-post_long1%>%filter(.imp==i)
+  
+  fit<-coxph(as.formula(formula),data=each_imp,x=TRUE,y=TRUE)
+  
+  fit_m1<-coxph(as.formula(formula_m1),data=each_imp,x=TRUE,y=TRUE)
+  
+  xs=Score(list("Baseline Cox"=fit,"Augmented Cox"=fit_m1),formula=Surv(TEU_BrCa_time,TEU_BrCa_status)~1,data=each_imp,conf.int=FALSE,metrics = "brier",times=10)
+  
+  Brier_training[[i]]<-xs$Brier$score%>%mutate(.imp=i)
+  
+  #basehaz_tot[[i]]<-basehaz(fit)
+  
+}
+
+Brier_training_df<-do.call(rbind.data.frame, Brier_training)
+
+pander(Brier_training_df%>%group_by(model)%>%summarise(median_Brier=pretty_dp(median(Brier),3)),caption = "Brier score of 3 Cox models using the training data.")
+
+```
+
+
+## Test performance
+
+Before computing C-index and Brier score, we need to obtain the pooled betas and baseline hazard. 
+
+Note: baseline hazard is only used for computing Brier score because it requires predicted survival probability at certain time point. Here we choose 10 years.
+
+```{r}
+#rmodel <- with(comp_long1_scaled, coxph(as.formula(formula)))
+
+pooled <- pool(rmodel)
+# Copy one of the fitted models fit to
+#   one of the imputed datasets
+pooled_1st = rmodel$analyses[[1]]
+# Replace the fitted coefficients with the pooled
+#   estimates (need to check they are replaced in
+#   the correct order)
+pooled_1st$coefficients = summary(pooled)$estimate
+
+```
+
+```{r}
+pooled_m1 <- pool(rmodel_m1_training)
+# Copy one of the fitted models fit to
+#   one of the imputed datasets
+pooled_m1_1st = rmodel_m1_training$analyses[[1]]
+# Replace the fitted coefficients with the pooled
+#   estimates (need to check they are replaced in
+#   the correct order)
+pooled_m1_1st$coefficients = summary(pooled_m1)$estimate
+
+```
+
+
+```{r baseline haz at 10 years}
+
+basehaz_10<-list()
+basehaz_m1_10<-list()
+for (i in 1:10) {
+  
+  each_imp<-post_long1%>%filter(.imp==i)
+  
+  fit<-coxph(as.formula(formula),data=each_imp,x=TRUE,y=TRUE)
+  
+  fit_m1<-coxph(as.formula(formula_m1),data=each_imp,x=TRUE,y=TRUE)
+  
+  # pick the closest one to 10 year
+  bh<-basehaz(fit,centered=FALSE)
+  bh_m1<-basehaz(fit_m1,centered=FALSE)
+  
+  basehaz_10[[i]]<-approx(bh$time,bh$hazard,10)$y
+  basehaz_m1_10[[i]]<-approx(bh_m1$time,bh_m1$hazard,10)$y
+  
+}
+
+
+# take the mean
+basehaz10_est=mean(unlist(basehaz_10))
+basehaz10_m1_est=mean(unlist(basehaz_m1_10))
+
+```
+
+
+
+```{r}
+# transfer test to long
+test_long <- complete(comp_long1_test,"long")
+
+test_long <- test_long%>%
+  mutate(baseline_pi=predict(pooled_1st,newdata = test_long,type = 'lp',reference="zero"),
+         m1_pi=predict(pooled_m1_1st,newdata=test_long,type='lp',reference="zero"))%>%
+  # predicted 10-year risk
+  mutate(baseline_rs=1-exp(-basehaz10_est)^exp(baseline_pi),
+         m1_rs=1-exp(-basehaz10_m1_est)^exp(m1_pi))
+
+```
+
+### C-index
+
+```{r test concordance}
+
+C_index<-test_long%>%
+  group_by(.imp)%>%
+  summarise(., C_index_baseline=concordance(Surv(TEU_BrCa_time,TEU_BrCa_status)~baseline_pi,reverse=TRUE)$concordance,
+            C_index_m1=concordance(Surv(TEU_BrCa_time,TEU_BrCa_status)~m1_pi,reverse=TRUE)$concordance)
+
+```
+
+### Brier score
+
+```{r}
+#https://github.com/tagteam/riskRegression/issues/32
+#https://github.com/tagteam/riskRegression/issues/28
+
+Brier_test<-list()
+for (i in 1:10) {
+  
+  each_imp<-test_long%>%filter(.imp==i)
+  
+  xs=Score(list("Baseline Cox"=each_imp$baseline_rs,"Augmented Cox"=each_imp$m1_rs),formula=Surv(TEU_BrCa_time,TEU_BrCa_status)~1,data=each_imp,conf.int=FALSE,metrics = "brier",times=10)
+  
+  Brier_test[[i]]<-xs$Brier$score%>%mutate(.imp=i)
+  
+  #basehaz_tot[[i]]<-basehaz(fit)
+  
+}
+
+Brier_test_df<-do.call(rbind.data.frame, Brier_test)
+
+pander(Brier_test_df%>%group_by(model)%>%summarise(median_Brier=pretty_dp(median(Brier),3)),caption = "Brier score of 3 Cox models using the test data.")
+
+```
+

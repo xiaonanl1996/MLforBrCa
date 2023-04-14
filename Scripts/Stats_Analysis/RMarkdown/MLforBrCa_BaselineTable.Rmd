@@ -1,0 +1,163 @@
+---
+title: "Table 1. Baseline characteristics"
+author: "Xiaonan Liu"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  word_document:
+      reference_docx: "K:/TEU/TEU_Guides/TEU_DocStyle_Rmd_2020.dotx"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,fig.pos = 'H')
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(magrittr)
+library(grid)
+library(dplyr)
+library(naniar)
+library(summarytools)
+library(pander)
+library(arsenal)
+
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+knitr::opts_knit$set(root.dir = here::here())
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions$JC))
+#source(here::here(config$functions$descriptive))
+
+tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
+tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
+
+xgboost_SHAP<-read.csv(here::here(file.path(config$outputs$outputs,"ML coxloss/XGBoost_Cox_SHAP.csv")))
+
+```
+
+```{r Data extraction,include=FALSE}
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+pretty_names <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type="list")
+pretty_func <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type = "function")
+
+
+pretty_names$TEU_BrCa_100k_PRS="$$PRS_{120k}$$"
+pretty_names$TEU_BrCa_313_PRS="$$PRS_{313}$$"
+pretty_names$G03FA="HRT user"
+
+# Add unit to features 
+pretty_names$BBC_TES_Result="Testosterone,nmol/L"
+pretty_names$FSF_MenopauseAge="Age at menopause,years"
+pretty_names$TEU_Alc_DailyAlcUnits="Daily alcohol intake,units"
+pretty_names$BBC_BUN_Result="Plasma urea,mmol/L"
+pretty_names$Imp_MetRate="Basal metabolic rate,KJ"
+pretty_names$BBC_PHOS_Result="Plasma phosphate,mmol/L"
+pretty_names$BBC_IGF1_Result="IGF-1,nmol/L"
+pretty_names$Uri_Sodium="Sodium in urine,mmol/L"
+pretty_names$BlA_RedBCCount="Red blood cell count,10^12/L"
+pretty_names$BBC_AST_Result="Aspartate aminotransferase,U/L"
+pretty_names$TEU_FirstBirthAgeCat="Age at first birth,years (Categorical)"
+pretty_names$Uri_Creat="Creatinine (enzymatic) in urine,mcmol/L"
+pretty_names$BlA_MonocytCount="Monocytes count,10^9/L"
+pretty_names$Imp_BodyFatMass="Whole body fat mass,Kg"
+pretty_names$BBC_ALP_Result="Alkaline phosphatase,U/L"
+pretty_names$BBC_CRP_Result="C-reactive protein,mg/L"
+pretty_names$FSF_PeriodAge="Age at menarche,years"
+pretty_names$PhA_METsWkAllAct="Summed MET minutes per week"
+pretty_names$TEU_BaC_AgeAtRec="Age at recruitment,years"
+pretty_names$BBC_GGT_Result="Gamma glutamyltransferase,U/L"
+pretty_names$BSM_BMI="BMI, kg/m^2"
+```
+
+# Table 1 (Descriptive Stats)
+
+Here I presented the descriptive statistics of variables fitted in the model (except genetic arrays and 10 PCs) on whole population (i.e. training + test data).
+
+
+```{r}
+
+imp_features<-c(
+  xgboost_SHAP$Var_name[c(1:8,10:20)],
+  # Because FaH of BrCa var name is in a different format
+  "TEU_FaH_BrCa",
+  # established RFs
+  "BSM_BMI", "G03FA","FSF_PeriodAge",
+   "FSF_NLiveBirths" 
+)
+
+```
+
+
+```{r}
+
+tot<-rbind(tot_train,tot_test)%>%
+  mutate(TEU_FirstBirthAgeCat=factor(case_when(
+    # If no live births given, assign "No births"
+    FSF_NLiveBirths==0 ~ "No Births",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge<20 ~ "<20",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=20 & TEU_FirstBirthAge<30 ~ "20-30",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=30 & TEU_FirstBirthAge<40 ~ "30-40",
+    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=40 ~ ">=40",
+    TRUE ~ NA_character_
+  ),levels=c("No Births","<20","20-30","30-40",">=40"))
+  )%>%
+  # PRS quintiles
+  mutate(TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels=c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')),
+         TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels=c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')))%>%
+  # Scale up PRS
+  mutate(TEU_BrCa_100k_PRS=TEU_BrCa_100k_PRS*115300*2,
+         TEU_BrCa_313_PRS=TEU_BrCa_313_PRS*305*2)
+
+# Replace Father death age and age at first birth with the manipulated ones 
+
+imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
+#imp_features=replace(imp_features,imp_features=="TEU_BrCa_100k_PRS","TEU_BrCa_100k_PRS_quint")
+#imp_features=replace(imp_features,imp_features=="TEU_BrCa_313_PRS","TEU_BrCa_313_PRS_quint")
+
+```
+
+
+```{r Descrp stats,results='asis'}
+
+my_controls <- tableby.control(
+    test = F,
+    total = T,
+    #numeric.test = "kwt", cat.test = "chisq",
+    numeric.stats = c("medianq1q3", "N"), 
+    cat.stats = c("countpct", "N"),
+    stats.labels = list(
+      #meansd = "Mean (SD)",
+      medianq1q3 = "Median (IQR)",
+      #range = "Min - Max",
+      N = "N",
+      Npct="N (Pct)"
+    ),
+    digits = 2L
+  )
+
+# Analysis vars (except Genetic array, 10 PCs)
+varlist <- c(imp_features,"TEU_BrCa_status")
+
+# Descrp stats by BrCa status
+
+
+table<-tableby(TEU_BrCa_status~.,data=tot%>%select(all_of(varlist))%>%mutate(G03FA=factor(G03FA,levels = c("0","1"),labels = c("No","Yes"))),control=my_controls)
+
+
+sumtab=summary(table,labelTranslations = pretty_names,title=paste0('Table 1. Descriptive statistics of analysis population by breast cancer status (N= ',nrow(tot),")"))
+
+sumtab
+```
+

@@ -1,0 +1,354 @@
+---
+title: "MLforBrCa: Build Cox models after MI"
+author: "Xiaonan Liu"
+date: "2023-04-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,fig.pos = 'H')
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(grid)
+library(dplyr)
+library(survival)
+library(survminer)
+library(naniar)
+library(summarytools)
+library(rsample)      # data splitting 
+library(gbm)          # basic implementation
+library(xgboost)      # a faster implementation of gbm
+library(caret)        # an aggregator package for performing many machine learning models
+library(pdp)          # model visualization
+library(lime)         # model visualization
+library(vip)          # Feature importance visualisation
+library(rms)
+library(mice)
+library(shiny)
+library(pander)
+library(arsenal)
+library(gtools)
+library(ggeffects)
+library(mitml)
+library(forestplot)
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+knitr::opts_knit$set(root.dir = here::here())
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions$JC))
+#source(here::here(config$functions$descriptive))
+
+#tot<-readRDS(here::here(file.path(config$data$derived,"tot_20220124.rds")))
+tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
+tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
+
+xgboost_SHAP<-read.csv(here::here(file.path(config$outputs$outputs,"ML coxloss/XGBoost_Cox_SHAP.csv")))
+
+load(here::here(file.path(config$data$derived,"Cox/imp_post_derived.rds")))
+
+# imp_post_derived_scaled was derived as below.
+load(here::here(file.path(config$data$derived,"Cox/imp_post_derived_scaled.rds")))
+
+```
+
+```{r Data extraction,include=FALSE}
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+pretty_names <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type="list")
+pretty_func <- pretty_switch(field_definitions=c(TEU_SPECS$BrCa_PRS,TEU_SPECS$HES_CaR), return_type = "function")
+
+
+pretty_names$TEU_BrCa_100k_PRS="$$PRS_{120k}$$"
+pretty_names$TEU_BrCa_313_PRS="$$PRS_{313}$$"
+pretty_names$G03FA="HRT user"
+
+# Add unit to features 
+pretty_names$BBC_TES_Result="Testosterone,nmol/L"
+pretty_names$FSF_MenopauseAge="Age at menopause,years"
+pretty_names$TEU_Alc_DailyAlcUnits="Daily alcohol intake,units"
+pretty_names$BBC_BUN_Result="Plasma urea,mmol/L"
+pretty_names$Imp_MetRate="Basal metabolic rate,KJ"
+pretty_names$BBC_PHOS_Result="Plasma phosphate,mmol/L"
+pretty_names$BBC_IGF1_Result="IGF-1,nmol/L"
+pretty_names$Uri_Sodium="Sodium in urine,mmol/L"
+pretty_names$BlA_RedBCCount="Red blood cell count,10^12/L"
+pretty_names$BBC_AST_Result="Aspartate aminotransferase,U/L"
+pretty_names$TEU_FirstBirthAgeCat="Age at first birth,years (Categorical)"
+pretty_names$Uri_Creat="Creatinine (enzymatic) in urine,mcmol/L"
+pretty_names$BlA_MonocytCount="Monocytes count,10^9/L"
+pretty_names$Imp_BodyFatMass="Whole body fat mass,Kg"
+pretty_names$BBC_ALP_Result="Alkaline phosphatase,U/L"
+pretty_names$BBC_CRP_Result="C-reactive protein,mg/L"
+pretty_names$FSF_PeriodAge="Age at menarche,years"
+pretty_names$PhA_METsWkAllAct="Summed MET minutes per week"
+pretty_names$TEU_BaC_AgeAtRec="Age at recruitment,years"
+pretty_names$BBC_GGT_Result="Gamma glutamyltransferase,U/L"
+pretty_names$BSM_BMI="BMI, kg/m^2"
+```
+
+# Scale training data after MI
+
+```{r post-processing scale training,eval=FALSE}
+
+# Post-hoc: Scale variables with HR CI (1,1) to show wider CI in forest plot
+# Scale alcohol per week to per day
+
+long1<-complete(imp_post,"long",include=TRUE)
+
+comp_long1_scaled<-long1%>%
+  mutate(
+    TEU_Alc_DailyAlcUnits=TEU_Alc_WeeklyAlcUnits/7,
+    )%>%
+  group_by(.imp)%>%
+  mutate(
+    # Scale variables by mean and sd within each imp
+    Imp_MetRate=scale_this(Imp_MetRate),
+    Uri_Sodium=scale_this(Uri_Sodium),
+    Uri_Creat=scale_this(Uri_Creat),
+    BBC_GGT_Result=scale_this(BBC_GGT_Result),
+    BBC_ALP_Result=scale_this(BBC_ALP_Result),
+    PhA_METsWkAllAct=scale_this(PhA_METsWkAllAct)
+  )
+  
+
+comp_long1_scaled<-as.mids(comp_long1_scaled)
+
+
+save(comp_long1_scaled,file=file.path(config$data$derived,'Cox/imp_post_derived_scaled.rds'))
+
+
+```
+
+
+# Cox models on training data
+
+## Baseline model 
+
+
+```{r Baseline model}
+
+eRFs <- c("TEU_BrCa_100k_PRS","TEU_BrCa_313_PRS","TEU_BaC_AgeAtRec","BSM_BMI","FSF_MenopauseAge","TEU_Alc_DailyAlcUnits","TEU_FirstBirthAgeCat","TEU_FaH_BrCa" ,  "PhA_METsWkAllAct" ,"G03FA", "FSF_PeriodAge","BBC_IGF1_Result" ,"BBC_TES_Result", "FSF_NLiveBirths" ,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(eRFs, collapse="+"))
+
+rmodel <- with(comp_long1_scaled, coxph(as.formula(formula)))
+
+routput_baseline <- printMIresults(df=comp_long1_scaled$data, varlist=eRFs, modeloutput=summary(pool(rmodel)),
+                              pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE)
+
+#View(routput_baseline)
+#kable(routput_baseline)%>%
+  #kable_styling(bootstrap_options = c("striped", "hover")) 
+```
+
+
+## New model 1 (adding novel predictors)
+
+```{r start}
+
+imp_features<-c(
+  xgboost_SHAP$Var_name[c(1:8,10:20)],
+  # Because FaH of BrCa var name is in a different format
+  "TEU_FaH_BrCa",
+  # established RFs
+  "BSM_BMI", "G03FA","FSF_PeriodAge",
+   "FSF_NLiveBirths" 
+)
+
+imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
+
+# Transform the variables fitted in the model
+imp_features=replace(imp_features,imp_features=="TEU_Alc_WeeklyAlcUnits","TEU_Alc_DailyAlcUnits")
+
+
+```
+
+```{r New Model 1 training data}
+
+varlist <- c(imp_features,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
+
+formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
+
+rmodel_m1_training <- with(comp_long1_scaled, coxph(as.formula(formula)))
+
+routput_m1_training <- printMIresults(df=comp_long1_scaled$data, varlist=varlist, modeloutput=summary(pool(rmodel_m1_training)),
+                              pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE)
+
+```
+
+```{r model checking,eval=FALSE}
+
+# Cox regression
+pha_plots<-list() #save PHA plot for each imputation
+vifs<-list() #save multicollinearity results
+
+for (i in 1:comp_long1_scaled$m) {
+  ## 1. PHA
+  pha_plots[[i]]<-ggcoxzph(cox.zph(rmodel_m1_training$analyses[[i]])) 
+  
+  ## 2. Multicollinearity (can only use rms::vif for cox regression)
+  formula<-as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status)~ TEU_BrCa_313_PRS+TEU_BrCa_100k_PRS+TEU_BaC_AgeAtRec+BBC_TES_Result+FSF_MenopauseAge+BBC_IGF1_Result+BBC_BUN_Result+TEU_Alc_DailyAlcUnits+Imp_MetRate+TEU_FirstBirthAgeCat+BBC_AST_Result+BBC_PHOS_Result+BBC_CRP_Result+Uri_Sodium+BlA_RedBCCount+BBC_GGT_Result+Uri_Creat+BBC_ALP_Result+PhA_METsWkAllAct+TEU_FaH_BrCa+BSM_BMI+G03FA+FSF_PeriodAge+FSF_NLiveBirths+GeP_Array+GeP_PC_1+GeP_PC_2+GeP_PC_3+GeP_PC_4+GeP_PC_5+GeP_PC_6+GeP_PC_7+GeP_PC_8+GeP_PC_9+GeP_PC_10")
+  
+  vifs[[i]]<-rms::vif(cph(formula,data=complete(comp_long1_scaled,i)))
+  cat("Imputation",i,", Any VIF above>10:",any(vifs[[i]]>10),'\n')
+  
+}
+
+# Use shinyapp for better visualisation (because sometimes when you have too many covariates, pha plot becomes squished together)
+
+choices = 1:comp_long1_scaled$m
+
+names(choices) <- paste("Imputation",1:comp_long1_scaled$m)
+shinyApp(
+  ui = fluidPage(
+    titlePanel("PHA plot on each imputation"),
+    sidebarPanel(
+      selectInput("plot", "Choose plot:", choices=choices),
+      hr()),
+      #helpText("Trail plots")),
+    plotOutput("mainplot")
+  ),
+  server = function(input, output) {
+    output$mainplot<-renderPlot({
+      i<- as.integer(input$plot)
+      pha_plots[[i]]
+    }, height = 1000, width = 2000)
+  }
+)
+
+```
+
+Forest plot for Cox model (training data).
+
+```{r forest plot,eval=FALSE}
+
+# Change order of FaH so corresponding to the SHAP order
+present=setdiff(imp_features,"TEU_FaH_BrCa")
+present <- append(present, values = "TEU_FaH_BrCa", after = match("Imp_MetRate", present) - 1)         
+
+m1_forplot <- printMIresults(df=comp_long1_scaled$data, varlist=present, modeloutput=summary(pool(rmodel_m1_training)),
+                                pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE,forplot = TRUE)
+
+cox_m1<-m1_forplot%>%
+  # Create HR (95% CI)
+  mutate(HR_CI=ifelse(is.na(L_CI),NA_character_,paste0(pretty_dp(HR_num,2)," ",pretty_confint(L_CI, U_CI, dp=2))))
+
+cox_m1$HR_CI[is.na(cox_m1$HR_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- "1"
+cox_m1$HR_num[is.na(cox_m1$HR_num) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+cox_m1$L_CI[is.na(cox_m1$L_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+cox_m1$U_CI[is.na(cox_m1$U_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
+
+# Hacky tweak so the cox model names correpsond to SHAP names
+cox_m1$IDcol[cox_m1$IDcol=="**$$PRS_{120k}$$ quintiles**"]="TEU_BrCa_100k_PRS"
+cox_m1$IDcol[cox_m1$IDcol=="**$$PRS_{313}$$ quintiles**"]="TEU_BrCa_313_PRS"
+cox_m1$IDcol[cox_m1$IDcol=="**Family history of BrCa**"]="TEU_FaH_BrCa_Family history of BrCa"
+cox_m1$IDcol[cox_m1$IDcol=="**Age at first birth,years (Categorical)**"]="TEU_FirstBirthAge"
+cox_m1$IDcol[cox_m1$IDcol=="TEU_Alc_DailyAlcUnits"]="TEU_Alc_WeeklyAlcUnits"
+
+# Add space for levels of categorical vars
+cox_m1<-cox_m1%>%
+  mutate(Coefficient=ifelse(!str_detect(Coefficient,fixed("**")),paste0("       ",Coefficient),Coefficient))
+
+#test<-cox_m1
+#test$Coefficient[c(2:6,8:12,17,18,28,32)]<-paste0("       ",test$Coefficient[c(2:6,8:12,17,18,28,32)])
+
+# Prepare SHAP 
+
+shap<-xgboost_SHAP[1:20,]%>%
+  select(Var_name,SHAP)%>%
+  #mutate(norm_SHAP=(SHAP-min(SHAP))/(max(SHAP)-min(SHAP)))%>%
+  mutate(SHAP_pretty=pretty_dp(SHAP,2))
+
+#shap$Var_name[shap$Var_name=="TEU_FaH_BrCa_Family history of BrCa"]="TEU_FaH_BrCa"
+#shap$Var_name[shap$Var_name=="TEU_BrCa_100k_PRS"]="TEU_BrCa_100k_PRS_quintiles"
+#shap$Var_name[shap$Var_name=="TEU_BrCa_313_PRS"]="TEU_BrCa_313_PRS_quintiles"
+#shap$Var_name[shap$Var_name=="TEU_FirstBirthAge"]="TEU_FirstBirthAgeCat"
+#shap$Var_name[shap$Var_name=="TEU_Alc_WeeklyAlcUnits"]="TEU_Alc_DailyAlcUnits"
+#shap$Var_name2=preparecoefflist_2col(df=comp_long1$data,varname = shap$Var_name,pretty_names = pretty_names)
+
+# Left join 
+
+cox_shap<-left_join(cox_m1,shap,by=c("IDcol"="Var_name"))%>%
+  select(Coefficient,SHAP_pretty,HR_CI,p,HR_num,L_CI,U_CI)%>%
+  mutate(summary=FALSE)%>%
+  mutate(Coefficient=str_remove_all(Coefficient,fixed("**")))%>%
+  add_row(Coefficient = "Features", SHAP_pretty="mean(|SHAP value|)",HR_CI="HR (95% CI)",p="p-value", summary=TRUE,.before = 1)%>%
+  rename(mean=HR_num,lower=L_CI,upper=U_CI)
+  
+
+
+# initialize plot
+#tiff(file.path(config$outputs$outputs,"forestplot_A.tiff"),  units = "in", width = 7, height = 25, res = 300)
+
+# make plot
+
+tabletext <- list(
+ c("Features",list(expression(PRS["313"])),list(expression(PRS["120k"])),cox_shap$Coefficient[4:nrow(cox_shap)]),
+  c(list(expression(SHAP["ma"])),cox_shap$SHAP_pretty[2:nrow(cox_shap)]),
+  cox_shap$HR_CI[1:nrow(cox_shap)],
+  cox_shap$p[1:nrow(cox_shap)]
+)
+
+# Note: for saving this super long forestplot, do not use the png function below, just manually export the plot with adjustment of width and height in the plots panel.
+#png(file=file.path(config$outputs$outputs,"/ML coxloss/forestplot.png"),width=500*2.5,height=600*2)
+
+cox_shap%>%
+  forestplot(labeltext = tabletext, 
+             is.summary = summary,
+             clip = c(0.3, 2.8), 
+             hrzl_lines = list("2" = gpar(lwd = 1, columns = 1:5, col = "#000044") 
+                               #"3" = gpar(lwd=1),
+                               #"9" = gpar(lwd=1),
+                               #"18" = gpar(lwd=1)
+                               ),
+             xlog = FALSE,
+             boxsize=0.4,
+             graph.pos=3,
+             colgap=unit(3, 'mm'),
+             graphwidth=unit(34, 'mm'),
+             lwd.ci=2,
+             lwd.xaxis=2,
+             zero = 1,
+             xticks = seq(0.5, 2.5, 0.5), 
+             txt_gp = fpTxtGp(ticks=gpar(cex=1)), #change xticks font size
+             #mar = unit(rep(10, times = 4), "mm"),
+             col = fpColors(box = "royalblue",
+                            line = "darkblue", 
+                            summary = "royalblue"))
+
+# save plot
+#dev.off()
+
+```
+
+```{r Merge train}
+
+# Merge baseline and New model1 analysis tgt
+output<-full_join(routput_baseline,routput_m1_training,by=c("IDcol"))%>%
+  select(Coefficient.y,HR.x,`95% CI.x`,p.x,HR.y,`95% CI.y`,p.y)%>%
+  `colnames<-`(c("Coefficient","HR","95% CI","p","HR","95% CI","p"))
+
+pander(output,caption=paste0("Cox regression of time until breast cancer using training data (",sum(comp_long1_scaled$data$TEU_BrCa_status)," events)"))
+
+```
+
+
+

@@ -1,10 +1,8 @@
 ---
-title: "MLforBrCa Cox model on training and test data"
+title: "MLforBrCa: Sensitivity analyses (i.e. Supplementary Material)"
 author: "Xiaonan Liu"
-date: "`r format(Sys.time(), '%d %B %Y')`"
-output: 
-  word_document:
-      reference_docx: "K:/TEU/TEU_Guides/TEU_DocStyle_Rmd_2020.dotx"
+date: "2023-04-12"
+output: html_document
 ---
 
 ```{r setup, include=FALSE}
@@ -30,21 +28,23 @@ library(naniar)
 library(summarytools)
 library(rsample)      # data splitting 
 library(gbm)          # basic implementation
-library(xgboost)      # a faster implementation of gbm
 library(caret)        # an aggregator package for performing many machine learning models
-library(h2o)          # a java-based platform
 library(pdp)          # model visualization
 library(lime)         # model visualization
 library(vip)          # Feature importance visualisation
 library(rms)
 library(mice)
-library(shiny)
 library(pander)
 library(arsenal)
 library(gtools)
 library(ggeffects)
-library(mitml)
+#library(mitml)
 library(forestplot)
+library(rcompanion)
+library(splines) #rcs
+library(riskRegression)
+library(glmnet)
+library(plotmo) # for plot_glmnet
 
 panderOptions('table.alignment.default', function(df)
     ifelse(sapply(df, is.numeric), 'right', 'left'))
@@ -64,15 +64,16 @@ tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
 
 xgboost_SHAP<-read.csv(here::here(file.path(config$outputs$outputs,"ML coxloss/XGBoost_Cox_SHAP.csv")))
 
-#load(here::here(file.path(config$data$derived,"Cox/imp_post.rds")))
+load(here::here(file.path(config$data$derived,"Cox/imp_post.rds")))
 load(here::here(file.path(config$data$derived,"Cox/imp_post_derived.rds")))
 load(here::here(file.path(config$data$derived,"Cox/imp_post_derived_scaled.rds")))
 
 
-#load(here::here(file.path(config$data$derived,"Cox/imp_post_test.rds")))
-#load(here::here(file.path(config$data$derived,"Cox/imp_post_test_derived.rds")))
+load(here::here(file.path(config$data$derived,"Cox/imp_post_test.rds")))
+load(here::here(file.path(config$data$derived,"Cox/imp_post_test_derived.rds")))
 load(here::here(file.path(config$data$derived,"Cox/imp_post_test_scaled.rds")))
 
+data<-readRDS(here::here(file.path(config$data$derived,"Otherethnic.rds")))
 ```
 
 ```{r Data extraction,include=FALSE}
@@ -109,39 +110,64 @@ pretty_names$PhA_METsWkAllAct="Summed MET minutes per week"
 pretty_names$TEU_BaC_AgeAtRec="Age at recruitment,years"
 pretty_names$BBC_GGT_Result="Gamma glutamyltransferase,U/L"
 pretty_names$BSM_BMI="BMI, kg/m^2"
+pretty_names$`TEU_FaH_BrCaNo family history of BrCa`="No family history of breast cancer"
 ```
 
-```{r post-processing scale training,eval=FALSE}
 
-# Post-hoc: Scale variables with HR CI (1,1) to show wider CI in forest plot
-# Scale alcohol per week to per day
-# Create quintiles for PRS
 
-long1<-complete(imp_post,"long",include=TRUE)
 
-comp_long1_scaled<-long1%>%
+# Correlation matrix (on training data)
+
+```{r imp features}
+
+imp_features<-c(
+  xgboost_SHAP$Var_name[c(1:8,10:20)],
+  # Because FaH of BrCa var name is in a different format
+  "TEU_FaH_BrCa",
+  # established RFs
+  "BSM_BMI", "G03FA","FSF_PeriodAge",
+   "FSF_NLiveBirths" 
+)
+
+#sapply(imp_features,function(i) pretty_names[[i]])
+```
+
+
+```{r cor,cache=TRUE}
+cor=mixed_assoc(tot_train%>%select(all_of(imp_features)))
+
+cor_df<-cor%>%
   mutate(
-    TEU_Alc_DailyAlcUnits=TEU_Alc_WeeklyAlcUnits/7,
-    )%>%
-  group_by(.imp)%>%
-  mutate(
-    # Scale variables by mean and sd within each imp
-    Imp_MetRate=scale_this(Imp_MetRate),
-    Uri_Sodium=scale_this(Uri_Sodium),
-    Uri_Creat=scale_this(Uri_Creat),
-    BBC_GGT_Result=scale_this(BBC_GGT_Result),
-    BBC_ALP_Result=scale_this(BBC_ALP_Result),
-    PhA_METsWkAllAct=scale_this(PhA_METsWkAllAct)
-  )
-  
+    xy=paste0(x,y),
+    yx=paste0(y,x),# don't want to show duplicates
+    assoc=round(assoc,2))%>%
+  filter(xy!=yx)%>%
+  filter(assoc>0.5|assoc< -0.5)%>%
+  rowwise()%>%
+  mutate(x=pretty_func(x),
+         y=pretty_func(y))%>%
+  select(x,y,assoc)%>%
+  arrange(desc(assoc))
 
-comp_long1_scaled<-as.mids(comp_long1_scaled)
+rownames(cor_df)=NULL
 
+# Transfer to correlation matrix format
+#df1 <- as.data.frame.matrix(xtabs(assoc ~ ., cor_df))
 
-save(comp_long1_scaled,file=file.path(config$data$derived,'Cox/imp_post_derived_scaled.rds'))
+# pretty names
+#df1<-tibble::rownames_to_column(df1, "VALUE")%>%
+  #rowwise()%>%
+  #mutate(VALUE=pretty_func(VALUE))
 
+#names(df1)<-sapply(names(df1),function(i) pretty_func(i))
+# Correlation matrix is too big for display
+
+pander(cor_df,caption = "Pairwise correlation matrix among the union of top 20 features and other established predictors using the training data. Only pairs with absolute correlation above 0.5 were displayed.")
 
 ```
+
+
+# Cox models using test data
 
 ```{r post-processing scale,eval=FALSE}
 # Post-hoc: Scale variables with HR CI (1,1) to show wider CI in forest plot
@@ -167,385 +193,6 @@ comp_long1_test_scaled<-as.mids(comp_long1_test_scaled)
 save(comp_long1_test_scaled,file=file.path(config$data$derived,'Cox/imp_post_test_scaled.rds'))
 ```
 
-# Table 1 (Descriptive Stats)
-
-Here I presented the descriptive statistics of variables fitted in the model (except genetic arrays and 10 PCs) on whole population (i.e. training + test data).
-
-
-```{r}
-
-imp_features<-c(
-  xgboost_SHAP$Var_name[c(1:8,10:20)],
-  # Because FaH of BrCa var name is in a different format
-  "TEU_FaH_BrCa",
-  # established RFs
-  "BSM_BMI", "G03FA","FSF_PeriodAge",
-   "FSF_NLiveBirths" 
-)
-
-```
-
-
-```{r}
-
-tot<-rbind(tot_train,tot_test)%>%
-  mutate(TEU_FirstBirthAgeCat=factor(case_when(
-    # If no live births given, assign "No births"
-    FSF_NLiveBirths==0 ~ "No Births",
-    FSF_NLiveBirths>0 & TEU_FirstBirthAge<20 ~ "<20",
-    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=20 & TEU_FirstBirthAge<30 ~ "20-30",
-    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=30 & TEU_FirstBirthAge<40 ~ "30-40",
-    FSF_NLiveBirths>0 & TEU_FirstBirthAge>=40 ~ ">=40",
-    TRUE ~ NA_character_
-  ),levels=c("No Births","<20","20-30","30-40",">=40"))
-  )%>%
-  # PRS quintiles
-  mutate(TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels=c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')),
-         TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels=c('Q1: Lowest level','Q2','Q3','Q4','Q5: Highest level')))%>%
-  # Scale up PRS
-  mutate(TEU_BrCa_100k_PRS=TEU_BrCa_100k_PRS*115300*2,
-         TEU_BrCa_313_PRS=TEU_BrCa_313_PRS*305*2)
-
-# Replace Father death age and age at first birth with the manipulated ones 
-
-imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
-#imp_features=replace(imp_features,imp_features=="TEU_BrCa_100k_PRS","TEU_BrCa_100k_PRS_quint")
-#imp_features=replace(imp_features,imp_features=="TEU_BrCa_313_PRS","TEU_BrCa_313_PRS_quint")
-
-```
-
-
-```{r Descrp stats,results='asis'}
-
-my_controls <- tableby.control(
-    test = F,
-    total = T,
-    #numeric.test = "kwt", cat.test = "chisq",
-    numeric.stats = c("medianq1q3", "N"), 
-    cat.stats = c("countpct", "N"),
-    stats.labels = list(
-      #meansd = "Mean (SD)",
-      medianq1q3 = "Median (IQR)",
-      #range = "Min - Max",
-      N = "N",
-      Npct="N (Pct)"
-    ),
-    digits = 2L
-  )
-
-# Analysis vars (except Genetic array, 10 PCs)
-varlist <- c(imp_features,"TEU_BrCa_status")
-
-# Descrp stats by BrCa status
-
-
-table<-tableby(TEU_BrCa_status~.,data=tot%>%select(all_of(varlist))%>%mutate(G03FA=factor(G03FA,levels = c("0","1"),labels = c("No","Yes"))),control=my_controls)
-
-
-sumtab=summary(table,labelTranslations = pretty_names,title=paste0('Table 1. Descriptive statistics of analysis population by breast cancer status (N= ',nrow(tot),")"))
-
-sumtab
-```
-
-# Cox models on training data
-
-## Baseline model 
-
-
-```{r Baseline model}
-# Changed whole body fat mass to BMI
-# Change PRS from quintiles to continuous
-
-eRFs <- c("TEU_BrCa_100k_PRS","TEU_BrCa_313_PRS","TEU_BaC_AgeAtRec","BSM_BMI","FSF_MenopauseAge","TEU_Alc_DailyAlcUnits","TEU_FirstBirthAgeCat","TEU_FaH_BrCa" ,  "PhA_METsWkAllAct" ,"G03FA", "FSF_PeriodAge","BBC_IGF1_Result" ,"BBC_TES_Result", "FSF_NLiveBirths" ,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
-
-formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(eRFs, collapse="+"))
-
-rmodel <- with(comp_long1_scaled, coxph(as.formula(formula)))
-
-routput_baseline <- printMIresults(df=comp_long1_scaled$data, varlist=eRFs, modeloutput=summary(pool(rmodel)),
-                              pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE)
-
-#View(routput_baseline)
-#kable(routput_baseline)%>%
-  #kable_styling(bootstrap_options = c("striped", "hover")) 
-```
-
-
-## New model 1 (adding novel predictors)
-
-```{r start}
-
-imp_features<-c(
-  xgboost_SHAP$Var_name[c(1:8,10:20)],
-  # Because FaH of BrCa var name is in a different format
-  "TEU_FaH_BrCa",
-  # established RFs
-  "BSM_BMI", "G03FA","FSF_PeriodAge",
-   "FSF_NLiveBirths" 
-)
-
-
-# Replace Father death age and age at first birth with the manipulated ones 
-
-imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
-
-# Transform the variables fitted in the model
-imp_features=replace(imp_features,imp_features=="TEU_Alc_WeeklyAlcUnits","TEU_Alc_DailyAlcUnits")
-
-
-```
-
-```{r New Model 1 training data}
-
-varlist <- c(imp_features,"GeP_Array",paste(paste0("GeP_PC_",1:10)))
-
-formula <- paste0("Surv(TEU_BrCa_time, TEU_BrCa_status)~ ", paste(varlist, collapse="+"))
-
-rmodel_m1_training <- with(comp_long1_scaled, coxph(as.formula(formula)))
-
-routput_m1_training <- printMIresults(df=comp_long1_scaled$data, varlist=varlist, modeloutput=summary(pool(rmodel_m1_training)),
-                              pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE)
-
-```
-
-```{r model checking,eval=FALSE}
-
-# Cox regression
-pha_plots<-list() #save PHA plot for each imputation
-vifs<-list() #save multicollinearity results
-
-for (i in 1:comp_long1_scaled$m) {
-  ## 1. PHA
-  pha_plots[[i]]<-ggcoxzph(cox.zph(rmodel_m1_training$analyses[[i]])) 
-  
-  ## 2. Multicollinearity (can only use rms::vif for cox regression)
-  formula<-as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status)~ TEU_BrCa_313_PRS+TEU_BrCa_100k_PRS+TEU_BaC_AgeAtRec+BBC_TES_Result+FSF_MenopauseAge+BBC_IGF1_Result+BBC_BUN_Result+TEU_Alc_DailyAlcUnits+Imp_MetRate+TEU_FirstBirthAgeCat+BBC_AST_Result+BBC_PHOS_Result+BBC_CRP_Result+Uri_Sodium+BlA_RedBCCount+BBC_GGT_Result+Uri_Creat+BBC_ALP_Result+PhA_METsWkAllAct+TEU_FaH_BrCa+BSM_BMI+G03FA+FSF_PeriodAge+FSF_NLiveBirths+GeP_Array+GeP_PC_1+GeP_PC_2+GeP_PC_3+GeP_PC_4+GeP_PC_5+GeP_PC_6+GeP_PC_7+GeP_PC_8+GeP_PC_9+GeP_PC_10")
-  
-  vifs[[i]]<-rms::vif(cph(formula,data=complete(comp_long1_scaled,i)))
-  cat("Imputation",i,", Any VIF above>10:",any(vifs[[i]]>10),'\n')
-  
-}
-
-# Use shinyapp for better visualisation (because sometimes when you have too many covariates, pha plot becomes squished together)
-
-choices = 1:comp_long1_scaled$m
-
-names(choices) <- paste("Imputation",1:comp_long1_scaled$m)
-shinyApp(
-  ui = fluidPage(
-    titlePanel("PHA plot on each imputation"),
-    sidebarPanel(
-      selectInput("plot", "Choose plot:", choices=choices),
-      hr()),
-      #helpText("Trail plots")),
-    plotOutput("mainplot")
-  ),
-  server = function(input, output) {
-    output$mainplot<-renderPlot({
-      i<- as.integer(input$plot)
-      pha_plots[[i]]
-    }, height = 1000, width = 2000)
-  }
-)
-
-```
-
-Forest plot for Cox model (training data).
-
-```{r forest plot,eval=FALSE}
-
-# Change order of FaH so corresponding to the SHAP order
-present=setdiff(imp_features,"TEU_FaH_BrCa")
-present <- append(present, values = "TEU_FaH_BrCa", after = match("Imp_MetRate", present) - 1)         
-
-m1_forplot <- printMIresults(df=comp_long1_scaled$data, varlist=present, modeloutput=summary(pool(rmodel_m1_training)),
-                                pretty_names=pretty_names, onecol=TRUE, IDcol=TRUE,forplot = TRUE)
-
-cox_m1<-m1_forplot%>%
-  # Create HR (95% CI)
-  mutate(HR_CI=ifelse(is.na(L_CI),NA_character_,paste0(pretty_dp(HR_num,2)," ",pretty_confint(L_CI, U_CI, dp=2))))
-
-cox_m1$HR_CI[is.na(cox_m1$HR_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- "1"
-cox_m1$HR_num[is.na(cox_m1$HR_num) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
-cox_m1$L_CI[is.na(cox_m1$L_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
-cox_m1$U_CI[is.na(cox_m1$U_CI) & (cox_m1$IDcol != cox_m1$Coefficient & !is.na(cox_m1$Coefficient))] <- 1
-
-# Hacky tweak so the cox model names correpsond to SHAP names
-cox_m1$IDcol[cox_m1$IDcol=="**$$PRS_{120k}$$ quintiles**"]="TEU_BrCa_100k_PRS"
-cox_m1$IDcol[cox_m1$IDcol=="**$$PRS_{313}$$ quintiles**"]="TEU_BrCa_313_PRS"
-cox_m1$IDcol[cox_m1$IDcol=="**Family history of BrCa**"]="TEU_FaH_BrCa_Family history of BrCa"
-cox_m1$IDcol[cox_m1$IDcol=="**Age at first birth,years (Categorical)**"]="TEU_FirstBirthAge"
-cox_m1$IDcol[cox_m1$IDcol=="TEU_Alc_DailyAlcUnits"]="TEU_Alc_WeeklyAlcUnits"
-
-# Add space for levels of categorical vars
-cox_m1<-cox_m1%>%
-  mutate(Coefficient=ifelse(!str_detect(Coefficient,fixed("**")),paste0("       ",Coefficient),Coefficient))
-
-#test<-cox_m1
-#test$Coefficient[c(2:6,8:12,17,18,28,32)]<-paste0("       ",test$Coefficient[c(2:6,8:12,17,18,28,32)])
-
-# Prepare SHAP 
-
-shap<-xgboost_SHAP[1:20,]%>%
-  select(Var_name,SHAP)%>%
-  #mutate(norm_SHAP=(SHAP-min(SHAP))/(max(SHAP)-min(SHAP)))%>%
-  mutate(SHAP_pretty=pretty_dp(SHAP,2))
-
-#shap$Var_name[shap$Var_name=="TEU_FaH_BrCa_Family history of BrCa"]="TEU_FaH_BrCa"
-#shap$Var_name[shap$Var_name=="TEU_BrCa_100k_PRS"]="TEU_BrCa_100k_PRS_quintiles"
-#shap$Var_name[shap$Var_name=="TEU_BrCa_313_PRS"]="TEU_BrCa_313_PRS_quintiles"
-#shap$Var_name[shap$Var_name=="TEU_FirstBirthAge"]="TEU_FirstBirthAgeCat"
-#shap$Var_name[shap$Var_name=="TEU_Alc_WeeklyAlcUnits"]="TEU_Alc_DailyAlcUnits"
-#shap$Var_name2=preparecoefflist_2col(df=comp_long1$data,varname = shap$Var_name,pretty_names = pretty_names)
-
-# Left join 
-
-cox_shap<-left_join(cox_m1,shap,by=c("IDcol"="Var_name"))%>%
-  select(Coefficient,SHAP_pretty,HR_CI,p,HR_num,L_CI,U_CI)%>%
-  mutate(summary=FALSE)%>%
-  mutate(Coefficient=str_remove_all(Coefficient,fixed("**")))%>%
-  add_row(Coefficient = "Features", SHAP_pretty="mean(|SHAP value|)",HR_CI="HR (95% CI)",p="p-value", summary=TRUE,.before = 1)%>%
-  rename(mean=HR_num,lower=L_CI,upper=U_CI)
-  
-
-
-# initialize plot
-#tiff(file.path(config$outputs$outputs,"forestplot_A.tiff"),  units = "in", width = 7, height = 25, res = 300)
-
-# make plot
-
-tabletext <- list(
- c("Features",list(expression(PRS["313"])),list(expression(PRS["120k"])),cox_shap$Coefficient[4:nrow(cox_shap)]),
-  c(list(expression(SHAP["ma"])),cox_shap$SHAP_pretty[2:nrow(cox_shap)]),
-  cox_shap$HR_CI[1:nrow(cox_shap)],
-  cox_shap$p[1:nrow(cox_shap)]
-)
-
-# Note: for saving this super long forestplot, do not use the png function below, just manually export the plot with adjustment of width and height in the plots panel.
-#png(file=file.path(config$outputs$outputs,"/ML coxloss/forestplot.png"),width=500*2.5,height=600*2)
-
-cox_shap%>%
-  forestplot(labeltext = tabletext, 
-             is.summary = summary,
-             clip = c(0.3, 2.8), 
-             hrzl_lines = list("2" = gpar(lwd = 1, columns = 1:5, col = "#000044") 
-                               #"3" = gpar(lwd=1),
-                               #"9" = gpar(lwd=1),
-                               #"18" = gpar(lwd=1)
-                               ),
-             xlog = FALSE,
-             boxsize=0.4,
-             graph.pos=3,
-             colgap=unit(3, 'mm'),
-             graphwidth=unit(34, 'mm'),
-             lwd.ci=2,
-             lwd.xaxis=2,
-             zero = 1,
-             xticks = seq(0.5, 2.5, 0.5), 
-             txt_gp = fpTxtGp(ticks=gpar(cex=1)), #change xticks font size
-             #mar = unit(rep(10, times = 4), "mm"),
-             col = fpColors(box = "royalblue",
-                            line = "darkblue", 
-                            summary = "royalblue"))
-
-# save plot
-#dev.off()
-
-```
-
-```{r Merge train}
-
-# Merge baseline and New model1 analysis tgt
-output<-full_join(routput_baseline,routput_m1_training,by=c("IDcol"))%>%
-  select(Coefficient.y,HR.x,`95% CI.x`,p.x,HR.y,`95% CI.y`,p.y)%>%
-  `colnames<-`(c("Coefficient","HR","95% CI","p","HR","95% CI","p"))
-
-pander(output,caption=paste0("Cox regression of time until breast cancer using training data (",sum(comp_long1_scaled$data$TEU_BrCa_status)," events)"))
-
-```
-
-
-
-# Harrell'C index 
-
-Harrell's C index on training data: 
-
-```{r}
-
-post_long1<-complete(comp_long1_scaled,"long")
-
-pool<-post_long1%>%
-  group_by(.imp)%>%
-  summarise(.,C_index_baseline=concordance(coxph(formula=as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status)~ TEU_BrCa_100k_PRS+TEU_BrCa_313_PRS+TEU_BaC_AgeAtRec+BSM_BMI+FSF_MenopauseAge+TEU_Alc_DailyAlcUnits+TEU_FirstBirthAgeCat+TEU_FaH_BrCa+PhA_METsWkAllAct+G03FA+FSF_PeriodAge+BBC_IGF1_Result+BBC_TES_Result+FSF_NLiveBirths+GeP_Array+GeP_PC_1+GeP_PC_2+GeP_PC_3+GeP_PC_4+GeP_PC_5+GeP_PC_6+GeP_PC_7+GeP_PC_8+GeP_PC_9+GeP_PC_10")))$concordance)
-
-```
-
-Training concordance index of baseline model (median of C-index from each imputation dataset): `r median(pool$C_index_baseline)`
-
-
-```{r}
-
-pooled <- pool(rmodel)
-# Copy one of the fitted models fit to
-#   one of the imputed datasets
-pooled_1st = rmodel$analyses[[1]]
-# Replace the fitted coefficients with the pooled
-#   estimates (need to check they are replaced in
-#   the correct order)
-pooled_1st$coefficients = summary(pooled)$estimate
-```
-
-
-```{r}
-
-post_long1<-complete(comp_long1_scaled,"long")
-
-pool2<-post_long1%>%
-  group_by(.imp)%>%
-  summarise(.,C_index=concordance(coxph(formula=as.formula("Surv(TEU_BrCa_time, TEU_BrCa_status)~ TEU_BrCa_313_PRS+TEU_BrCa_100k_PRS+TEU_BaC_AgeAtRec+BBC_TES_Result+FSF_MenopauseAge+BBC_IGF1_Result+BBC_BUN_Result+TEU_Alc_DailyAlcUnits+Imp_MetRate+TEU_FirstBirthAgeCat+BBC_AST_Result+BBC_PHOS_Result+BBC_CRP_Result+Uri_Sodium+BlA_RedBCCount+BBC_GGT_Result+Uri_Creat+BBC_ALP_Result+PhA_METsWkAllAct+TEU_FaH_BrCa+BSM_BMI+G03FA+FSF_PeriodAge+FSF_NLiveBirths+GeP_Array+GeP_PC_1+GeP_PC_2+GeP_PC_3+GeP_PC_4+GeP_PC_5+GeP_PC_6+GeP_PC_7+GeP_PC_8+GeP_PC_9+GeP_PC_10")))$concordance)
-
-```
-
-Training concordance index of new model (median of C-index from each imputation dataset): `r median(pool2$C_index)`
-
-
-Harrell's C-index on test data:
-
-```{r}
-
-pooled_m1 <- pool(rmodel_m1_training)
-# Copy one of the fitted models fit to
-#   one of the imputed datasets
-pooled_m1_1st = rmodel_m1_training$analyses[[1]]
-# Replace the fitted coefficients with the pooled
-#   estimates (need to check they are replaced in
-#   the correct order)
-pooled_m1_1st$coefficients = summary(pooled_m1)$estimate
-
-```
-
-
-```{r}
-# transfer test to long
-test_long <- complete(comp_long1_test_scaled,"long")
-
-test_long <- test_long%>%
-  mutate(baseline_pi=predict(pooled_1st,newdata = test_long,type = 'lp'),
-         m1_pi=predict(pooled_m1_1st,newdata=test_long,type='lp'))
-```
-
-
-```{r}
-C_index=test_long%>%group_by(.imp)%>%
-  summarise(., C_index_baseline=survConcordance(Surv(TEU_BrCa_time,TEU_BrCa_status)~baseline_pi)$concordance,
-            C_index_m1=survConcordance(Surv(TEU_BrCa_time,TEU_BrCa_status)~m1_pi)$concordance)
-#pander(as.data.frame(C_index),caption = "Harrell's C-index of 2 models on test data")
-```
-
-Median of C-index for baseline model is `r median(C_index$C_index_baseline)` and for new model 1 is `r median(C_index$C_index_m1)`.
-
-
-# Sensitivity Analysis: Cox model on test data
 
 ```{r Baseline model test data}
 
@@ -599,18 +246,13 @@ pander(routput_m1%>%select(!c(IDcol,Coefficient.test)),caption="New Cox model fi
 
 ```
 
-
-# Sensitivity analyses: Exclude first 2 yrs FU (Training)
+# Exclude first 2 yrs FU (Training)
 
 To further investigate blood count, biochemistry, urine assays variables (in New Model 2), we would like to restrict our analysis population to people with 2 or more years follow up and see if they are still significant. The logic behind this is to see if significance were due to reverse causation. 
 
-
 Out of `r nrow(tot_train)` post-menopausal women, there were `r tot_train%>%filter(TEU_BrCa_time>=2)%>%nrow` with 2 or more years follow up.
 
-
 ```{r SA New Model 1,eval=FALSE}
-
-load(here::here(file.path(config$data$derived,"Cox/imp_post.rds")))
 
 # Transform to long first 
 post.long <- mice::complete(imp_post,"long",include = T)
@@ -751,6 +393,7 @@ cox_shap%>%
 #dev.off()
 
 ```
+
 
 # Age PRS interaction
 

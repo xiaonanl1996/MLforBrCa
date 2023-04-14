@@ -30,7 +30,6 @@ library(rsample)      # data splitting
 library(gbm)          # basic implementation
 library(xgboost)      # a faster implementation of gbm
 library(caret)        # an aggregator package for performing many machine learning models
-library(h2o)          # a java-based platform
 library(pdp)          # model visualization
 library(lime)         # model visualization
 library(vip)          # Feature importance visualisation
@@ -65,7 +64,7 @@ footnote_no <- 1
 tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
 tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
 
-xgboost_SHAP<-read.csv(here::here(file.path(config$outputs$outputs,"XGBoost_SHAP.csv")))
+xgboost_SHAP<-read.csv(here::here(file.path(config$outputs$outputs,"ML coxloss/XGBoost_Cox_SHAP.csv")))
 
 ```
 
@@ -88,7 +87,7 @@ This report documents process of feature inspection (e.g. correlation eliminatio
 First we would start with a set containing the union of the following:
 
 * Top 20 'important' features based on SHAP values
-* Other established breast cancer risk factors (BMI, physical activity, age at menarche, number of live births, hormone replacement treatment)
+* Other established breast cancer risk factors (BMI, age at menarche, number of live births, hormone replacement treatment)
 
 Note: The established breast cancer risk factors that were not picked out as top 20 important features from XGBoost all had non-zero SHAP values, they just didn't make to top 20.
 
@@ -97,11 +96,11 @@ Note: The established breast cancer risk factors that were not picked out as top
 
 
 imp_features<-c(
-  xgboost_SHAP$Var_name[c(1:5,7:20)],
+  xgboost_SHAP$Var_name[c(1:8,10:20)],
   # Because FaH of BrCa var name is in a different format
   "TEU_FaH_BrCa",
   # established RFs
-  "BSM_BMI", "PhA_METsWkAllAct", "G03FA","FSF_PeriodAge",
+  "BSM_BMI", "G03FA","FSF_PeriodAge",
    "FSF_NLiveBirths" 
 )
 
@@ -131,29 +130,8 @@ This approach was based on [Madakkatel2021](https://www.nature.com/articles/s415
 cor=mixed_assoc(tot_train%>%select(all_of(imp_features)))
 
 # Filter for correlation above 0.9
-cor%>%filter(x!=y & assoc>0.9)%>%
-  rowwise()%>%
-  mutate(x=pretty_func(x),
-         y=pretty_func(y))%>%
-  rename(Var1=x,Var2=y,Correlation=assoc)
-
-```
-
-The observation is variables from [Body composition by impedance](https://biobank.ndph.ox.ac.uk/showcase/label.cgi?id=100009) BMI and whole body fat mass are highly correlated (which is expected). We would remove BMI and retain whole body fat mass because whole body fat mass captures is assumed to be superior than BMI.
-
-```{r missing train}
-
-highcor=cor%>%filter(x!=y & assoc>0.9)%>%pull(x)%>%unique
-
-tot_train%>%select(all_of(imp_features))%>%miss_var_summary()%>%rowwise()%>%mutate(variable=pretty_func(variable))
-
-```
-
-
-```{r remove Imp}
-
-imp_features<-imp_features[!grepl("BSM_BMI",imp_features)]
-
+cor%>%filter(x!=y & assoc>0.9)
+# None
 ```
 
 Now we have total of `r length(imp_features)` features.
@@ -186,31 +164,13 @@ tot_train<-tot_train%>%
     FSF_NLiveBirths>0 & TEU_LastBirthAge>=30 & TEU_LastBirthAge<40 ~ "30-40",
     FSF_NLiveBirths>0 & TEU_LastBirthAge>=40 ~ ">=40",
     TRUE ~ NA_character_
-  ),levels=c("No Births","<20","20-30","30-40",">=40")),
-  
-  TEU_FatherDthAgeCat=factor(case_when(
-    FaH_FatherAlive=="No" & FaH_FatherDeathAge<40 ~ "<40",
-    FaH_FatherAlive=="No" & FaH_FatherDeathAge>=40 & FaH_FatherDeathAge<60 ~ "40-60",
-    FaH_FatherAlive=="No" & FaH_FatherDeathAge>=60 & FaH_FatherDeathAge<80 ~ "60-80",
-    FaH_FatherAlive=="No" & FaH_FatherDeathAge>=80 ~ ">=80",
-    # If participants indicate their father still alive, assign alive
-    FaH_FatherAlive=="Yes" ~ "Alive",
-    TRUE ~ NA_character_
-  ),levels = c("<40","40-60","60-80",">=80","Alive"))
-  
+  ),levels=c("No Births","<20","20-30","30-40",">=40"))
   )
 
-# Replace Father death age and age at first birth with the manipulated ones 
 
 imp_features=replace(imp_features,imp_features=="TEU_FirstBirthAge","TEU_FirstBirthAgeCat")
-#imp_features=replace(imp_features,imp_features=="TEU_LastBirthAge","TEU_LastBirthAgeCat")
-#imp_features=replace(imp_features,imp_features=="FaH_FatherDeathAge","TEU_FatherDthAgeCat")
-
-# Add those 2 vars pretty names 
 
 pretty_names$TEU_FirstBirthAgeCat="Age at First birth (Categorical)"
-#pretty_names$TEU_LastBirthAgeCat="Age at Last birth (Categorical)"
-#pretty_names$TEU_FatherDthAgeCat="Father death age (Categorical)"
 
 ```
 
@@ -242,11 +202,11 @@ MI_data=tot_train[,c("TEU_BrCa_status","TEU_BrCa_time",
                        )]
 
 
-# Need to Scale up PRS
+# Standardise PRS
 
 MI_data=MI_data%>%
-  mutate(TEU_BrCa_100k_PRS=TEU_BrCa_100k_PRS*115300*2,
-         TEU_BrCa_313_PRS=TEU_BrCa_313_PRS*305*2)
+  mutate(TEU_BrCa_100k_PRS=scale(TEU_BrCa_100k_PRS)[,1],
+         TEU_BrCa_313_PRS=scale(TEU_BrCa_313_PRS)[,1])
 
 
 ```
@@ -268,16 +228,16 @@ post["FSF_NLiveBirths"] <- "imp[[j]][data$TEU_FirstBirthAgeCat[!r[,j]]=='No Birt
 
 pred <- quickpred(MI_data,include = c("TEU_BrCa_status", "TEU_BrCa_time",
                                       "TEU_BrCa_100k_PRS","TEU_BrCa_313_PRS",
-                                          "TEU_BaC_AgeAtRec","Imp_BodyFatMass","PhA_METsWkAllAct",
+                                      "BBC_TES_Result","FSF_MenopauseAge",
+                                      "BBC_IGF1_Result",
+                                          "TEU_BaC_AgeAtRec","BSM_BMI","PhA_METsWkAllAct",
                                           "TEU_Alc_WeeklyAlcUnits","TEU_FaH_BrCa",
                                           "G03FA","FSF_PeriodAge","FSF_NLiveBirths",
                                           "TEU_FirstBirthAgeCat"))
 
 imp_post<-mice(MI_data,post=post,pred=pred,maxit = 20,seed = 100,m=10) 
 
-save(imp_post,file=file.path(config$data$derived,'imp_post.rds'))
-
-
+save(imp_post,file=file.path(config$data$derived,'Cox/imp_post.rds'))
 
 ```
 
@@ -384,7 +344,6 @@ MIcompare(names(factor_tb)[1])
 ```{r post-processing,eval=FALSE}
 
 # Scale alcohol per week to per day
-# Scale PRS to percentiles
 # Age into 3 groups for later inspection 
 
 long1<-complete(imp_post,"long",include=TRUE)
@@ -396,51 +355,12 @@ comp_long1<-long1%>%
                        breaks = c(40, 53, 60, 70),
                        labels = c("[40,53)", "[53,60)", "[60,70)"),
                        right = FALSE
-    ))%>%
-  group_by(.imp)%>%
-  mutate(TEU_BrCa_100k_PRS_percent=Percentile(TEU_BrCa_100k_PRS),
-         TEU_BrCa_313_PRS_percent=Percentile(TEU_BrCa_313_PRS),
-         TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')),
-         TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')))
-  
+    ))
 
 comp_long1<-as.mids(comp_long1)
 
 
-save(comp_long1,file=file.path(config$data$derived,'imp_post_derived.rds'))
-
-
-```
-
-```{r post-processing scale,eval=FALSE}
-
-# Post-hoc: Scale variables with HR CI (1,1) to show wider CI in forest plot
-# Scale alcohol per week to per day
-# Create quintiles for PRS
-
-long1<-complete(imp_post,"long",include=TRUE)
-
-comp_long1_scaled<-long1%>%
-  mutate(
-    TEU_Alc_DailyAlcUnits=TEU_Alc_WeeklyAlcUnits/7,
-    )%>%
-  group_by(.imp)%>%
-  mutate(
-    # Scale variables by mean and sd within each imp
-    Imp_MetRate=scale_this(Imp_MetRate),
-    Uri_Sodium=scale_this(Uri_Sodium),
-    Uri_Creat=scale_this(Uri_Creat),
-    BBC_ALP_Result=scale_this(BBC_ALP_Result),
-    PhA_METsWkAllAct=scale_this(PhA_METsWkAllAct),
-    TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')),
-    TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score'))
-  )
-  
-
-comp_long1_scaled<-as.mids(comp_long1_scaled)
-
-
-save(comp_long1_scaled,file=file.path(config$data$derived,'imp_post_derived_scaled.rds'))
+save(comp_long1,file=file.path(config$data$derived,'Cox/imp_post_derived.rds'))
 
 
 ```
@@ -450,19 +370,14 @@ save(comp_long1_scaled,file=file.path(config$data$derived,'imp_post_derived_scal
 
 ```{r}
 
-
 imp_features<-c(
-  xgboost_SHAP$Var_name[c(1:5,7:20)],
+  xgboost_SHAP$Var_name[c(1:8,10:20)],
   # Because FaH of BrCa var name is in a different format
   "TEU_FaH_BrCa",
   # established RFs
-  "BSM_BMI", "PhA_METsWkAllAct", "G03FA","FSF_PeriodAge",
-  "FSF_NLiveBirths" 
+  "BSM_BMI", "G03FA","FSF_PeriodAge",
+   "FSF_NLiveBirths" 
 )
-
-
-# Remove whole body fat mass due to high cor with BMI
-imp_features<-imp_features[!grepl("BSM_BMI",imp_features)]
 
 
 # Categorise first birth age 
@@ -500,11 +415,12 @@ MI_data=tot_test[,c("TEU_BrCa_status","TEU_BrCa_time",
 )]
 
 
-# Need to Scale up PRS
+# Need to Scale PRS
 
 MI_data=MI_data%>%
-  mutate(TEU_BrCa_100k_PRS=TEU_BrCa_100k_PRS*115300*2,
-         TEU_BrCa_313_PRS=TEU_BrCa_313_PRS*305*2)
+  mutate(TEU_BrCa_100k_PRS=(TEU_BrCa_100k_PRS-mean(tot_train$TEU_BrCa_100k_PRS))/sd(tot_train$TEU_BrCa_100k_PRS),
+         TEU_BrCa_313_PRS=(TEU_BrCa_313_PRS-mean(tot_train$TEU_BrCa_313_PRS))/sd(tot_train$TEU_BrCa_313_PRS))
+
 
 ```
 
@@ -516,14 +432,16 @@ post["FSF_NLiveBirths"] <- "imp[[j]][data$TEU_FirstBirthAgeCat[!r[,j]]=='No Birt
 
 pred <- quickpred(MI_data,include = c("TEU_BrCa_status", "TEU_BrCa_time",
                                       "TEU_BrCa_100k_PRS","TEU_BrCa_313_PRS",
-                                      "TEU_BaC_AgeAtRec","Imp_BodyFatMass","PhA_METsWkAllAct",
-                                      "TEU_Alc_WeeklyAlcUnits","TEU_FaH_BrCa",
-                                      "G03FA","FSF_PeriodAge","FSF_NLiveBirths",
-                                      "TEU_FirstBirthAgeCat"))
+                                      "BBC_TES_Result","FSF_MenopauseAge",
+                                      "BBC_IGF1_Result",
+                                          "TEU_BaC_AgeAtRec","BSM_BMI","PhA_METsWkAllAct",
+                                          "TEU_Alc_WeeklyAlcUnits","TEU_FaH_BrCa",
+                                          "G03FA","FSF_PeriodAge","FSF_NLiveBirths",
+                                          "TEU_FirstBirthAgeCat"))
 
 imp_post_test<-mice(MI_data,post=post,pred=pred,maxit = 20,seed = 100,m=10) 
 
-save(imp_post_test,file=file.path(config$data$derived,'imp_post_test.rds'))
+save(imp_post_test,file=file.path(config$data$derived,'Cox/imp_post_test.rds'))
 
 ```
 
@@ -581,7 +499,6 @@ for (var in missing_var){
 
 ```{r}
 # Scale alcohol per week to per day
-# Scale PRS to percentiles
 # Age into 3 groups for later inspection 
 
 long1<-complete(imp_post_test,"long",include=TRUE)
@@ -593,18 +510,12 @@ comp_long1<-long1%>%
                        breaks = c(40, 53, 60, 70),
                        labels = c("[40,53)", "[53,60)", "[60,70)"),
                        right = FALSE
-    ))%>%
-  group_by(.imp)%>%
-  mutate(TEU_BrCa_100k_PRS_percent=Percentile(TEU_BrCa_100k_PRS),
-         TEU_BrCa_313_PRS_percent=Percentile(TEU_BrCa_313_PRS),
-         TEU_BrCa_100k_PRS_quint=quantcut(TEU_BrCa_100k_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')),
-         TEU_BrCa_313_PRS_quint=quantcut(TEU_BrCa_313_PRS,q=5,labels = c('Q1: Lowest score','Q2','Q3','Q4','Q5: Highest score')))
-
+    ))
 
 comp_long1_test<-as.mids(comp_long1)
 
 
-save(comp_long1_test,file=file.path(config$data$derived,'imp_post_test_derived.rds'))
+save(comp_long1_test,file=file.path(config$data$derived,'Cox/imp_post_test_derived.rds'))
 
 ```
 
